@@ -17,6 +17,47 @@ import android.view.KeyEvent;
  * NativeActivity.
  */
 public class CraftLauncherActivity extends NativeActivity {
+
+    @Override
+    protected void onCreate(android.os.Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        applyImmersiveFullscreen();
+    }
+
+    /** Force true fullscreen: hide the status bar and the system navigation
+     *  bar / tablet taskbar ("dock") so they never overlay the app. Sticky
+     *  immersive: a swipe from a screen edge reveals the bars briefly. */
+    private void applyImmersiveFullscreen() {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                getWindow().setDecorFitsSystemWindows(false);
+                android.view.WindowInsetsController c = getWindow().getInsetsController();
+                if (c != null) {
+                    c.hide(android.view.WindowInsets.Type.systemBars());
+                    c.setSystemBarsBehavior(
+                        android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                }
+            } else {
+                getWindow().getDecorView().setSystemUiVisibility(
+                    android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | android.view.View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | android.view.View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+            }
+        } catch (Exception ignored) {
+            // Fullscreen is cosmetic; never let it break start-up.
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            applyImmersiveFullscreen();
+        }
+    }
     // ---- Bluetooth keyboard modifier tracking ---------------------------------
     // winit's Android backend doesn't reliably report Ctrl/Shift/Alt meta state
     // from Bluetooth keyboards. We track modifier keys here and synthesize

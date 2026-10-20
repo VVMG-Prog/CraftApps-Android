@@ -221,6 +221,92 @@ pub fn open_url(url: &str) -> Result<(), String> {
     })
 }
 
+/// The activity's `ClipboardManager` system service.
+fn clipboard_manager<'a>(env: &mut Env<'a>, activity: &JObject<'_>) -> JniResult<JObject<'a>> {
+    let name = jstring(env, "clipboard")?;
+    Ok(env
+        .call_method(
+            activity,
+            jni_str!("getSystemService"),
+            jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
+            &[JValue::from(&name)],
+        )?
+        .l()?)
+}
+
+/// Put plain text on the Android system clipboard (`ClipboardManager`).
+/// Used by ports whose upstream uses `arboard` for text; image clipboard
+/// data stays in the app's own clipboard (arboard has no Android backend).
+pub fn clipboard_set_text(text: &str) -> Result<(), String> {
+    with_env(|env, activity| {
+        let cm = clipboard_manager(env, activity)?;
+        let label = jstring(env, "PdfCraft")?;
+        let text_j = jstring(env, text)?;
+        let clip = env
+            .call_static_method(
+                jni_str!("android/content/ClipData"),
+                jni_str!("newPlainText"),
+                jni_sig!("(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;"),
+                &[JValue::from(&label), JValue::from(&text_j)],
+            )?
+            .l()?;
+        env.call_method(
+            &cm,
+            jni_str!("setPrimaryClip"),
+            jni_sig!("(Landroid/content/ClipData;)V"),
+            &[JValue::from(&clip)],
+        )?;
+        Ok(())
+    })
+}
+
+/// Read plain text from the Android system clipboard. Returns `Ok(None)`
+/// when the clipboard is empty or holds no text.
+pub fn clipboard_get_text() -> Result<Option<String>, String> {
+    with_env(|env, activity| {
+        let cm = clipboard_manager(env, activity)?;
+        let has = env
+            .call_method(&cm, jni_str!("hasPrimaryClip"), jni_sig!("()Z"), &[])?
+            .z()?;
+        if !has {
+            return Ok(None);
+        }
+        let clip = env
+            .call_method(&cm, jni_str!("getPrimaryClip"), jni_sig!("()Landroid/content/ClipData;"), &[])?
+            .l()?;
+        if clip.is_null() {
+            return Ok(None);
+        }
+        let count = env.call_method(&clip, jni_str!("getItemCount"), jni_sig!("()I"), &[])?.i()?;
+        if count <= 0 {
+            return Ok(None);
+        }
+        let item = env
+            .call_method(
+                &clip,
+                jni_str!("getItemAt"),
+                jni_sig!("(I)Landroid/content/ClipData$Item;"),
+                &[JValue::from(0)],
+            )?
+            .l()?;
+        let text = env
+            .call_method(&item, jni_str!("getText"), jni_sig!("()Ljava/lang/CharSequence;"), &[])?
+            .l()?;
+        if text.is_null() {
+            return Ok(None);
+        }
+        let s = env
+            .call_method(&text, jni_str!("toString"), jni_sig!("()Ljava/lang/String;"), &[])?
+            .l()?;
+        let s: JString = env.cast_local::<JString>(s)?;
+        let out = s.mutf8_chars(env).map_err(BridgeError::from)?.to_str().into_owned();
+        if out.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    })
+}
+
 /// `(version_code, version_name)` for an installed package, or `None` when
 /// the package isn't installed. The Craft Launcher uses this to show each
 /// suite app's installed version.

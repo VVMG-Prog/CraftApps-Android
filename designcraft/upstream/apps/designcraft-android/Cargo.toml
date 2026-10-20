@@ -1,0 +1,33 @@
+[package]
+name = "designcraft-android"
+version = "0.9.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "DesignCraft for Android (tablet): page-layout studio with stylus support"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Internal workspace crates.
+designcraft-engine = { workspace = true }
+designcraft-ui-egui = { workspace = true }
+# eframe on Android: NativeActivity entry, wgpu renderer. NOTE: the `accesskit`
+# feature is a compile error with `android-native-activity` (eframe 0.36's
+# lib.rs), so it is deliberately absent here. designcraft-ui-egui does not
+# depend on eframe, so no feature unification pulls accesskit in.
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "android-native-activity"] }
+egui = { workspace = true }
+android-activity = { version = "=0.6.1", features = ["native-activity"] }
+# Shared suite shell: JNI bridge, SAF pickers, storage, GPU cascade, pen.
+craftapps-shared = { path = "../../../../shared" }
+jni = "=0.22.4"
+ndk-context = "=0.1.1"
+log = "0.4"
+android_logger = "0.15"
+serde_json = "1"
+
+# NOTE: this crate does NOT forbid unsafe: the JNI entry points an Android
+# shell fundamentally needs it (same rationale as craftlauncher-android).
+# It denies unwrap/expect/panic/todo like every other crate, and every
+# unsafe block carries a SAFETY comment.

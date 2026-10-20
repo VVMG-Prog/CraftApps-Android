@@ -159,6 +159,17 @@ impl StorageManager {
         &self.settings_dir
     }
 
+    /// `<root>/CraftApps/Media` on tablet storage (shared by the suite).
+    pub fn tablet_media_dir(&self) -> &Path {
+        &self.tablet_media
+    }
+
+    /// The suite's shared media tree (`/sdcard/CraftApps/Media/`): the root
+    /// of the in-app file browsers.
+    pub fn media_dir(&self) -> &Path {
+        &self.tablet_media
+    }
+
     /// Suite-shared WebAssembly plug-in folder (`/sdcard/CraftApps/Plugins/`).
     /// Unused for now: the engine's `PlugIns` default already points at this
     /// path (see `crates/engine/src/prefs.rs`); the method stays for the

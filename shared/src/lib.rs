@@ -11,6 +11,7 @@
 pub mod gpu;
 pub mod jni_bridge;
 pub mod pen;
+pub mod picker_bridge;
 pub mod saf;
 pub mod services;
 pub mod storage;

@@ -95,11 +95,15 @@ done
 
 # --- 3. Gradle assembleRelease (suite keystore, no proxy) ---
 # The Hatch CA for the JDK (proxy TLS interception) — harmless if already present.
+# Skipped entirely on machines without the Hatch egress CA (e.g. the homelab,
+# which reaches Maven Central / Google Maven directly).
+if [ -f /usr/local/share/ca-certificates/hatch-egress-ca.crt ]; then
 if ! "$JAVA_HOME/bin/keytool" -list -keystore "$JAVA_HOME/lib/security/cacerts" \
     -storepass changeit -alias hatch-egress-ca >/dev/null 2>&1; then
   "$JAVA_HOME/bin/keytool" -importcert -noprompt -trustcacerts \
     -alias hatch-egress-ca -file /usr/local/share/ca-certificates/hatch-egress-ca.crt \
     -keystore "$JAVA_HOME/lib/security/cacerts" -storepass changeit
+fi
 fi
 # NOTE: sandbox reaches Maven Central / Google Maven directly; do NOT proxy Gradle.
 export GRADLE_OPTS="-Djava.net.preferIPv4Stack=true"

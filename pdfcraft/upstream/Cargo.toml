@@ -109,6 +109,9 @@ codegen-units = 1
 
 # Vendored, patched third-party crates (see vendor/README.md). Each patch is meant to go upstream.
 [patch.crates-io]
+# ANDROID-PORT: the vendored android-activity with the CraftApps stylus patch.
+# Lives at the monorepo root (../../vendor), vendored by scripts/vendor-android-activity.sh.
+android-activity = { path = "../../vendor/android-activity" }
 hayro-interpret = { path = "vendor/hayro-interpret" }
 hayro = { path = "vendor/hayro" }
 hayro-syntax = { path = "vendor/hayro-syntax" }

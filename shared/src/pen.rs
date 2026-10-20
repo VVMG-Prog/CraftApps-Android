@@ -89,8 +89,9 @@ impl PenButton {
     }
 }
 
-/// App-agnostic actions a pen button can trigger. Each port maps these to its
-/// own commands (see PhotoCraft's `shell.rs` for the reference mapping).
+/// App-agnostic actions a pen button or touch gesture can trigger. Each port
+/// maps these to its own commands (see PhotoCraft's `shell.rs` for the
+/// reference mapping).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PenAction {
     /// Do nothing.
@@ -105,6 +106,8 @@ pub enum PenAction {
     PanTool,
     /// Right-click at the pen tip.
     RightClick,
+    /// Open the radial tool wheel at the tap point.
+    ToolWheel,
 }
 
 impl PenAction {
@@ -117,10 +120,11 @@ impl PenAction {
             PenAction::Eyedropper => "Eyedropper",
             PenAction::PanTool => "Pan tool (while held)",
             PenAction::RightClick => "Right-click",
+            PenAction::ToolWheel => "Tool wheel",
         }
     }
 
-    pub fn all() -> [PenAction; 7] {
+    pub fn all() -> [PenAction; 8] {
         [
             PenAction::None,
             PenAction::Undo,
@@ -129,6 +133,7 @@ impl PenAction {
             PenAction::Eyedropper,
             PenAction::PanTool,
             PenAction::RightClick,
+            PenAction::ToolWheel,
         ]
     }
 
@@ -219,6 +224,14 @@ pub struct PenSettings {
     pub button_primary: PenAction,
     pub button_secondary: PenAction,
     pub eraser_action: PenAction,
+    /// Stylus mode: multi-finger tap gestures for tool switching while drawing.
+    /// When enabled, 3-finger and 4-finger taps trigger the configured actions
+    /// instead of being treated as canvas gestures.
+    pub stylus_mode: bool,
+    /// Action for 3-finger tap (default: Undo).
+    pub three_finger_tap: PenAction,
+    /// Action for 4-finger tap (default: ToolWheel).
+    pub four_finger_tap: PenAction,
 }
 
 impl Default for PenSettings {
@@ -233,6 +246,9 @@ impl Default for PenSettings {
             button_primary: PenAction::RightClick,
             button_secondary: PenAction::None,
             eraser_action: PenAction::ToggleEraser,
+            stylus_mode: false,
+            three_finger_tap: PenAction::Undo,
+            four_finger_tap: PenAction::ToolWheel,
         }
     }
 }
@@ -322,6 +338,10 @@ impl PressureSmoother {
 pub struct PenButtonEvent {
     pub button: PenButton,
     pub pressed: bool,
+    /// Position (in pixels) where the event occurred, from the MotionEvent.
+    /// Used for hover button presses where egui has no pointer position.
+    pub x: f32,
+    pub y: f32,
 }
 
 struct PenRuntime {
@@ -352,6 +372,10 @@ struct PenRuntime {
 pub struct QueuedAction {
     pub action: PenAction,
     pub pressed: bool,
+    /// Position (in pixels) where the action occurred. Used for RightClick
+    /// synthesis when the pen is hovering.
+    pub x: f32,
+    pub y: f32,
 }
 
 static RUNTIME: OnceLock<Mutex<PenRuntime>> = OnceLock::new();
@@ -397,8 +421,9 @@ fn button_index(b: PenButton) -> usize {
 
 /// Called by the JNI entry when Java reports a pen state change.
 /// `action`: MotionEvent action masked; `tool`: `getToolType`;
-/// `buttons`: `getButtonState` bits; `action_button`: `getActionButton`.
-pub fn on_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32) {
+/// `buttons`: `getButtonState` bits; `action_button`: `getActionButton`;
+/// `x`, `y`: position in pixels from the MotionEvent.
+pub fn on_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32, x: f32, y: f32) {
     // Android constants (stable API literals, mirroring MotionEvent).
     const ACTION_BUTTON_PRESS: i32 = 11;
     const ACTION_BUTTON_RELEASE: i32 = 12;
@@ -434,7 +459,7 @@ pub fn on_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32) {
 
     // Eraser end: tool-type transition acts like a button.
     let eraser_now = tool == TOOL_ERASER && (action == ACTION_DOWN || action == 2);
-    set_button(&mut rt, PenButton::Eraser, eraser_now);
+    set_button(&mut rt, PenButton::Eraser, eraser_now, x, y);
 
     // Barrel buttons: transitions via ACTION_BUTTON_PRESS/RELEASE, or the
     // held state on DOWN/MOVE.
@@ -442,33 +467,33 @@ pub fn on_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32) {
     let secondary_held = buttons & BUTTON_STYLUS_SECONDARY != 0;
     if action == ACTION_BUTTON_PRESS {
         if action_button == BUTTON_STYLUS_PRIMARY {
-            set_button(&mut rt, PenButton::BarrelPrimary, true);
+            set_button(&mut rt, PenButton::BarrelPrimary, true, x, y);
         } else if action_button == BUTTON_STYLUS_SECONDARY {
-            set_button(&mut rt, PenButton::BarrelSecondary, true);
+            set_button(&mut rt, PenButton::BarrelSecondary, true, x, y);
         }
     } else if action == ACTION_BUTTON_RELEASE {
         if action_button == BUTTON_STYLUS_PRIMARY {
-            set_button(&mut rt, PenButton::BarrelPrimary, false);
+            set_button(&mut rt, PenButton::BarrelPrimary, false, x, y);
         } else if action_button == BUTTON_STYLUS_SECONDARY {
-            set_button(&mut rt, PenButton::BarrelSecondary, false);
+            set_button(&mut rt, PenButton::BarrelSecondary, false, x, y);
         }
     } else {
-        set_button(&mut rt, PenButton::BarrelPrimary, primary_held);
-        set_button(&mut rt, PenButton::BarrelSecondary, secondary_held);
+        set_button(&mut rt, PenButton::BarrelPrimary, primary_held, x, y);
+        set_button(&mut rt, PenButton::BarrelSecondary, secondary_held, x, y);
     }
 
     // Lift/cancel clears everything: a pen that leaves the screen cannot be
     // holding a button. Prevents stuck "pressed" states.
     if action == ACTION_UP || action == ACTION_CANCEL {
-        set_button(&mut rt, PenButton::BarrelPrimary, false);
-        set_button(&mut rt, PenButton::BarrelSecondary, false);
-        set_button(&mut rt, PenButton::Eraser, false);
+        set_button(&mut rt, PenButton::BarrelPrimary, false, x, y);
+        set_button(&mut rt, PenButton::BarrelSecondary, false, x, y);
+        set_button(&mut rt, PenButton::Eraser, false, x, y);
     }
 }
 
 /// Record a button transition; on change, queue the event and the remapped
 /// action (or complete a capture).
-fn set_button(rt: &mut PenRuntime, button: PenButton, pressed: bool) {
+fn set_button(rt: &mut PenRuntime, button: PenButton, pressed: bool, x: f32, y: f32) {
     let i = button_index(button);
     if rt.pressed[i] == pressed {
         return;
@@ -485,7 +510,7 @@ fn set_button(rt: &mut PenRuntime, button: PenButton, pressed: bool) {
         }
     }
 
-    rt.queue.push_back(PenButtonEvent { button, pressed });
+    rt.queue.push_back(PenButtonEvent { button, pressed, x, y });
 
     // Remap to the configured action.
     let action = settings_snap()
@@ -498,7 +523,32 @@ fn set_button(rt: &mut PenRuntime, button: PenButton, pressed: bool) {
     if !action.is_momentary() && !pressed {
         return; // fire one-shot actions on press only
     }
-    rt.actions.push_back(QueuedAction { action, pressed });
+    rt.actions.push_back(QueuedAction { action, pressed, x, y });
+}
+
+/// Called by the JNI entry when Java detects a multi-finger tap gesture.
+/// `fingers`: 3 or 4 (number of fingers in the tap); `x`, `y`: tap position
+/// in pixels. Only fires when stylus mode is enabled in settings.
+pub fn on_gesture(fingers: i32, x: f32, y: f32) {
+    let Ok(mut rt) = runtime().lock() else { return };
+    let action = settings_snap()
+        .lock()
+        .map(|s| {
+            if !s.stylus_mode {
+                return PenAction::None;
+            }
+            match fingers {
+                3 => s.three_finger_tap,
+                4 => s.four_finger_tap,
+                _ => PenAction::None,
+            }
+        })
+        .unwrap_or(PenAction::None);
+    if action == PenAction::None {
+        return;
+    }
+    // Gestures are one-shot: fire on the tap (pressed=true).
+    rt.actions.push_back(QueuedAction { action, pressed: true, x, y });
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +560,21 @@ pub fn drain_button_events() -> Vec<PenButtonEvent> {
         .lock()
         .map(|mut rt| rt.queue.drain(..).collect())
         .unwrap_or_default()
+}
+
+/// Current pressed state of each physical pen button, for diagnostics UI.
+/// Returns `(barrel_primary, barrel_secondary, eraser)`.
+pub fn button_state() -> (bool, bool, bool) {
+    runtime()
+        .lock()
+        .map(|rt| {
+            (
+                rt.pressed[button_index(PenButton::BarrelPrimary)],
+                rt.pressed[button_index(PenButton::BarrelSecondary)],
+                rt.pressed[button_index(PenButton::Eraser)],
+            )
+        })
+        .unwrap_or((false, false, false))
 }
 
 /// Drain remapped actions. Call once per frame; dispatch each to the app's
@@ -587,9 +652,9 @@ pub fn take_captured() -> Option<(PenButton, PenButton)> {
 // own mangled symbol — see PhotoCraft's saf.rs pattern).
 
 /// Handle a pen state change from Java. See module docs for the protocol.
-pub fn handle_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32) {
+pub fn handle_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32, x: f32, y: f32) {
     // Never unwind into the JVM.
-    let _ = std::panic::catch_unwind(|| on_pen_event(action, tool, buttons, action_button));
+    let _ = std::panic::catch_unwind(|| on_pen_event(action, tool, buttons, action_button, x, y));
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +669,26 @@ pub fn pen_settings_ui(
     on_change: &mut dyn FnMut(),
 ) {
     let mut changed = false;
+
+    // Live button state indicator (diagnostic): shows which physical buttons
+    // the app is currently seeing as pressed. If pressing the S Pen button
+    // doesn't light these up, the events aren't reaching the app.
+    let (primary, secondary, eraser) = button_state();
+    ui.horizontal(|ui| {
+        ui.label("Button state:");
+        let dot = |ui: &mut egui::Ui, label: &str, active: bool| {
+            let color = if active {
+                egui::Color32::GREEN
+            } else {
+                egui::Color32::DARK_GRAY
+            };
+            ui.colored_label(color, format!("● {label}"));
+        };
+        dot(ui, "Primary", primary);
+        dot(ui, "Secondary", secondary);
+        dot(ui, "Eraser", eraser);
+    });
+    ui.add_space(4.0);
 
     ui.label("Pressure");
     let mut enabled = settings.pressure_enabled;
@@ -719,6 +804,45 @@ pub fn pen_settings_ui(
         ui.ctx().request_repaint();
     }
 
+    ui.add_space(10.0);
+    ui.label("Stylus mode");
+    ui.label("Multi-finger tap gestures for fast tool switching while drawing with the pen.");
+    let mut stylus_mode = settings.stylus_mode;
+    if ui.checkbox(&mut stylus_mode, "Enable stylus mode gestures").changed() {
+        settings.stylus_mode = stylus_mode;
+        changed = true;
+    }
+    if settings.stylus_mode {
+        ui.add_space(4.0);
+        // 3-finger tap configuration
+        ui.horizontal(|ui| {
+            ui.label("3-finger tap");
+            egui::ComboBox::from_id_salt("pen-gesture-3")
+                .selected_text(settings.three_finger_tap.label())
+                .show_ui(ui, |ui| {
+                    for a in PenAction::all() {
+                        if ui.selectable_value(&mut settings.three_finger_tap, a, a.label()).changed() {
+                            changed = true;
+                        }
+                    }
+                });
+        });
+        // 4-finger tap configuration
+        ui.horizontal(|ui| {
+            ui.label("4-finger tap");
+            egui::ComboBox::from_id_salt("pen-gesture-4")
+                .selected_text(settings.four_finger_tap.label())
+                .show_ui(ui, |ui| {
+                    for a in PenAction::all() {
+                        if ui.selectable_value(&mut settings.four_finger_tap, a, a.label()).changed() {
+                            changed = true;
+                        }
+                    }
+                });
+        });
+        ui.label("Tip: 3 fingers for Undo, 4 fingers for the tool wheel.");
+    }
+
     if changed {
         sync_settings(settings);
         on_change();
@@ -742,7 +866,7 @@ fn swap_button_actions(settings: &mut PenSettings, a: PenButton, b: PenButton) {
 
 /// Which [`PenAction`]s the app actually supports, for greying out rows.
 /// (Kept simple: all actions are offered; the port's dispatch maps them.)
-pub fn supported_actions() -> [PenAction; 7] {
+pub fn supported_actions() -> [PenAction; 8] {
     PenAction::all()
 }
 

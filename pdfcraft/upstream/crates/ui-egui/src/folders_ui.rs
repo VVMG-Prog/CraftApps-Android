@@ -183,13 +183,15 @@ fn cloud_drive(folder: &str) -> String {
 impl PdfCraftApp {
     /// File ▸ Pin folder to Home…: choose a folder whose newest PDFs Home lists.
     pub fn pin_folder_dialog(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         {
-            let dialog = rfd::AsyncFileDialog::new().set_title(tl!("Pin a folder to Home").to_string());
+            let dialog = crate::rfd::AsyncFileDialog::new().set_title(tl!("Pin a folder to Home").to_string());
             self.ask_one(crate::pickers::Ask::Folder(dialog), None, |app, dir| {
                 app.pin_folder(&dir.to_string_lossy());
             });
         }
+        #[cfg(target_os = "android")]
+        self.notify_tr("Pinned folders need the desktop app");
         #[cfg(target_arch = "wasm32")]
         self.notify_tr("Pinned folders need the desktop app");
     }

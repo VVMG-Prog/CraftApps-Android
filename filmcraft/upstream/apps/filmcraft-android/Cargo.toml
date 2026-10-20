@@ -1,0 +1,36 @@
+[package]
+name = "filmcraft-android"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "FilmCraft for Android (tablet): native eframe port with stylus, SAF pickers and hardware acceleration"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# eframe on Android: NativeActivity entry, wgpu renderer. NOTE: the `accesskit`
+# feature is a compile error with `android-native-activity` (eframe 0.36), so
+# it is deliberately absent here — and in filmcraft-ui-egui's Android target
+# deps (feature unification would otherwise re-enable it).
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "android-native-activity"] }
+egui = "0.36"
+android-activity = { version = "=0.6.1", features = ["native-activity"] }
+# Shared suite shell: JNI bridge, SAF pickers, storage, GPU cascade, pen input.
+craftapps-shared = { path = "../../../../shared" }
+filmcraft-engine = { workspace = true }
+filmcraft-media = { workspace = true }
+filmcraft-ui-egui = { workspace = true }
+jni = "=0.22.4"
+ndk-context = "=0.1.1"
+log = "0.4"
+android_logger = "0.15"
+serde_json = "1"
+# Audio output: cpal 0.16's Android backend is AAudio (via the ndk crate) —
+# no oboe C++ build needed.
+cpal = "0.16"
+
+# NOTE: this crate does NOT opt into the workspace lints (`unsafe_code =
+# "forbid"`): the JNI entries an Android shell fundamentally needs are unsafe.
+# It denies unwrap/expect/panic/todo like every other port crate, and every
+# unsafe block carries a SAFETY comment.

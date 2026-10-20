@@ -1,0 +1,239 @@
+diff -ruN a/src/input/stylus.rs b/src/input/stylus.rs
+--- a/src/input/stylus.rs	1969-12-31 18:00:00.000000000 -0600
++++ b/src/input/stylus.rs	2026-10-19 21:45:22.270383404 -0500
+@@ -0,0 +1,134 @@
++//! The stylus data of the most recent motion event.
++//!
++//! ANDROID-PORT (CraftApps): the app never sees the `MotionEvent` itself —
++//! winit owns the input queue and drops the stylus data (the tool type and
++//! the barrel-button state) — so it is recorded here as the events pass by,
++//! and the app reads it with [`stylus_state`].
++//!
++//! The data is the same the Java API exposes: `MotionEvent.getButtonState()`
++//! (the `BUTTON_STYLUS_*` bits) and `MotionEvent.getToolType()`.
++
++use std::sync::Mutex;
++
++/// The stylus data of the most recent motion event.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct StylusState {
++    /// The `MotionEvent.getButtonState()` bits. A stylus' side button sets
++    /// `BUTTON_STYLUS_PRIMARY` (`1 << 5`) or `BUTTON_STYLUS_SECONDARY`
++    /// (`1 << 6`).
++    pub buttons: u32,
++    /// The `MotionEvent.getToolType()` of the event's first pointer:
++    /// 0 unknown, 1 finger, 2 stylus, 3 mouse, 4 eraser, 5 palm.
++    pub tool_type: i32,
++    /// The action of the event: 0 down, 1 up, 2 move, 3 cancel.
++    pub action: i32,
++    /// The `MotionEvent.getActionButton()` bits: which button changed in a
++    /// button press or release event.
++    pub action_button: u32,
++    /// The position of the event's first pointer, in pixels.
++    pub x: f32,
++    /// The position of the event's first pointer, in pixels.
++    pub y: f32,
++}
++
++/// How many stylus events are kept before the oldest are dropped.
++const QUEUE_LIMIT: usize = 256;
++
++static QUEUE: Mutex<Vec<StylusState>> = Mutex::new(Vec::new());
++
++/// The stylus data of the motion events since the last call, oldest first.
++///
++/// ANDROID-PORT (CraftApps): the events are queued rather than sampled, so a
++/// quick button press and release cannot slip through between two frames.
++pub fn drain_stylus_states() -> Vec<StylusState> {
++    let mut queue = QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
++    std::mem::take(&mut *queue)
++}
++
++/// Record a stylus button that arrived as a key event
++/// (`KEYCODE_STYLUS_BUTTON_PRIMARY` and friends).
++///
++/// ANDROID-PORT (CraftApps): translated into the same protocol as the motion
++/// events, so the app reads the button the same way either way.
++pub(crate) fn record_stylus_button_key(key_code: i32, pressed: bool) {
++    let Some(button) = stylus_button_key(key_code) else { return };
++    let (x, y) = last_position();
++    record_stylus_state(&StylusState {
++        buttons: if pressed { button } else { 0 },
++        tool_type: 0,
++        action: if pressed { 11 } else { 12 }, // ACTION_BUTTON_PRESS / _RELEASE
++        action_button: button,
++        x,
++        y,
++    });
++}
++
++/// The last position the stylus reported.
++fn last_position() -> (f32, f32) {
++    let queue = QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
++    queue
++        .iter()
++        .rev()
++        .find(|state| state.tool_type != 0)
++        .map_or((0.0, 0.0), |state| (state.x, state.y))
++}
++
++/// Record the stylus data of a motion event (called by the input layer).
++pub(crate) fn record_stylus_state(state: &StylusState) {
++    let mut queue = QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
++    if queue.len() >= QUEUE_LIMIT {
++        // The app is not draining: drop the oldest events rather than grow.
++        queue.remove(0);
++    }
++    queue.push(*state);
++}
++
++/// Samsung's S Pen reports its side button by *replacing* the motion action
++/// with a proprietary variant instead of setting the button bits:
++///
++/// | action | meaning                    |
++/// |--------|----------------------------|
++/// | 211    | down, with the button held |
++/// | 213    | move, with the button held |
++/// | 212    | up, with the button held   |
++/// | 214    | cancel, with the button held |
++///
++/// The NDK has no name for those, so they arrive as `MotionAction::__Unknown`
++/// and a consumer that only knows the standard actions drops the event — the
++/// stroke stops while the button is held. Map them back to the standard
++/// actions; the button state itself is read from the event's button bits, or
++/// — on the tablets that only report the action — from the action itself
++/// (see [`samsung_pen_button_action`]).
++pub(crate) fn normalize_action(action: i32) -> i32 {
++    match action {
++        211 => 0, // AMOTION_EVENT_ACTION_DOWN
++        212 => 1, // AMOTION_EVENT_ACTION_UP
++        213 => 2, // AMOTION_EVENT_ACTION_MOVE
++        214 => 3, // AMOTION_EVENT_ACTION_CANCEL
++        other => other,
++    }
++}
++
++/// Is this one of Samsung's "the side button is held" actions?
++pub(crate) fn samsung_pen_button_action(action: i32) -> bool {
++    matches!(action, 211 | 212 | 213 | 214)
++}
++
++/// Android's `KEYCODE_STYLUS_BUTTON_PRIMARY` / `_SECONDARY`.
++///
++/// Android 14 and later report the stylus' side buttons as key events too.
++/// That is the only report a button press *while the pen hovers* produces on
++/// some devices (there is no touch event then), so it is translated into the
++/// same protocol as the motion events: an `ACTION_BUTTON_PRESS` /
++/// `_RELEASE` with the matching button.
++pub(crate) const KEYCODE_STYLUS_BUTTON_PRIMARY: i32 = 308;
++pub(crate) const KEYCODE_STYLUS_BUTTON_SECONDARY: i32 = 309;
++
++/// The button bits of a stylus button key code, if it is one.
++pub(crate) fn stylus_button_key(key_code: i32) -> Option<u32> {
++    match key_code {
++        KEYCODE_STYLUS_BUTTON_PRIMARY => Some(ndk_sys::AMOTION_EVENT_BUTTON_STYLUS_PRIMARY),
++        KEYCODE_STYLUS_BUTTON_SECONDARY => Some(ndk_sys::AMOTION_EVENT_BUTTON_STYLUS_SECONDARY),
++        _ => None,
++    }
++}
+diff -ruN a/src/input.rs b/src/input.rs
+--- a/src/input.rs	2026-10-19 21:45:21.618300077 -0500
++++ b/src/input.rs	2026-10-19 21:45:22.271922871 -0500
+@@ -8,6 +8,9 @@
+ mod sdk;
+ pub use sdk::*;
+ 
++mod stylus;
++pub use stylus::*;
++
+ /// An enum representing the source of an [`MotionEvent`] or [`KeyEvent`]
+ ///
+ /// See [the InputDevice docs](https://developer.android.com/reference/android/view/InputDevice#SOURCE_ANY)
+diff -ruN a/src/native_activity/input.rs b/src/native_activity/input.rs
+--- a/src/native_activity/input.rs	2026-10-19 21:45:21.619265691 -0500
++++ b/src/native_activity/input.rs	2026-10-19 21:45:22.270978577 -0500
+@@ -57,9 +57,56 @@
+         let action =
+             unsafe { ndk_sys::AMotionEvent_getAction(self.ndk_event.ptr().as_ptr()) as u32 }
+                 & ndk_sys::AMOTION_EVENT_ACTION_MASK;
++        // ANDROID-PORT (CraftApps): Samsung's S Pen replaces the action with a
++        // proprietary variant while its side button is held (211/213/212/214);
++        // map them back to the standard actions so the events keep flowing.
++        let action = crate::input::normalize_action(action as i32) as u32;
+         action.into()
+     }
+ 
++    /// Record the stylus data of this event.
++    ///
++    /// ANDROID-PORT (CraftApps): the app cannot see the motion event itself
++    /// (winit owns the input queue and drops the stylus data), so the tool
++    /// type and the button state are recorded here on the way past.
++    pub(crate) fn record_stylus_state(&self) {
++        let action_button = u32::from(self.action_button());
++        // The raw action: Samsung's S Pen replaces it with a proprietary
++        // variant while its side button is held.
++        let raw_action =
++            unsafe { ndk_sys::AMotionEvent_getAction(self.ndk_event.ptr().as_ptr()) as i32 }
++                & ndk_sys::AMOTION_EVENT_ACTION_MASK as i32;
++        let mut buttons = self.button_state().0;
++        if crate::input::samsung_pen_button_action(raw_action) {
++            // The tablet reports the button through the action, not through
++            // the button bits: report it the standard way, so the app can
++            // read it like any other stylus button.
++            buttons |= ndk_sys::AMOTION_EVENT_BUTTON_STYLUS_PRIMARY;
++        }
++        // A button-only event (ACTION_BUTTON_PRESS) has no pointer: the
++        // button state still matters, but there is no tool type or position.
++        if self.pointer_count() == 0 {
++            crate::input::record_stylus_state(&crate::input::StylusState {
++                buttons,
++                tool_type: 0,
++                action: u32::from(self.action()) as i32,
++                action_button,
++                x: 0.0,
++                y: 0.0,
++            });
++            return;
++        }
++        let pointer = self.pointer_at_index(0);
++        crate::input::record_stylus_state(&crate::input::StylusState {
++            buttons,
++            tool_type: u32::from(pointer.tool_type()) as i32,
++            action: u32::from(self.action()) as i32,
++            action_button,
++            x: pointer.x(),
++            y: pointer.y(),
++        });
++    }
++
+     /// Returns which button has been modified during a press or release action.
+     ///
+     /// For actions other than [`MotionAction::ButtonPress`] and
+diff -ruN a/src/native_activity/mod.rs b/src/native_activity/mod.rs
+--- a/src/native_activity/mod.rs	2026-10-19 21:45:21.619460202 -0500
++++ b/src/native_activity/mod.rs	2026-10-19 21:45:22.271396559 -0500
+@@ -577,9 +577,23 @@
+             if let Some(ndk_event) = queue.pre_dispatch(ndk_event) {
+                 let event = match ndk_event {
+                     ndk::event::InputEvent::MotionEvent(e) => {
+-                        input::InputEvent::MotionEvent(input::MotionEvent::new(e))
++                        let motion = input::MotionEvent::new(e);
++                        // ANDROID-PORT (CraftApps): record the stylus data
++                        // (tool type, side button) on the way past — the app
++                        // never sees the motion event itself.
++                        motion.record_stylus_state();
++                        input::InputEvent::MotionEvent(motion)
+                     }
+                     ndk::event::InputEvent::KeyEvent(e) => {
++                        // ANDROID-PORT (CraftApps): Android 14 and later report
++                        // the stylus' side buttons as key events — the only
++                        // report a button press *while the pen hovers*
++                        // produces. Translate it into the motion-event
++                        // protocol, so the app reads the button the same way.
++                        crate::input::record_stylus_button_key(
++                            i32::from(e.key_code()),
++                            e.action() == ndk::event::KeyAction::Down,
++                        );
+                         input::InputEvent::KeyEvent(input::KeyEvent::new(e))
+                     }
+                     _ => todo!("NDK added a new type"),

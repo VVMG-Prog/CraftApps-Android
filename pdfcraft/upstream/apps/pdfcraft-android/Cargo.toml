@@ -1,0 +1,33 @@
+[package]
+name = "pdfcraft-android"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "PdfCraft for Android (tablet): NativeActivity shell with SAF file pickers, stylus support and shared CraftApps storage"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# eframe on Android: NativeActivity entry, wgpu renderer. NOTE: the `accesskit`
+# feature is a compile error with `android-native-activity` (see eframe 0.36
+# src/lib.rs), so it is deliberately absent here — and in pdfcraft-ui-egui's
+# Android target deps as well (feature unification would otherwise re-enable it).
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "android-native-activity"] }
+egui = "0.36"
+android-activity = { version = "=0.6.1", features = ["native-activity"] }
+# The PdfCraft UI (eframe app). On Android its rfd dependency resolves to the
+# in-tree shim (crate::rfd in ui-egui); pick types come through its android
+# module re-exports.
+pdfcraft-ui-egui = { path = "../../crates/ui-egui" }
+# Shared suite shell: JNI bridge, SAF pickers, storage, GPU cascade, pen.
+# (Path dep: the pdfcraft workspace doesn't define it; the suite root does.)
+craftapps-shared = { path = "../../../../shared" }
+jni = "=0.22.4"
+ndk-context = "=0.1.1"
+log = "0.4"
+android_logger = "0.15"
+
+# NOTE: this crate does NOT forbid unsafe: the JNI calls an Android shell
+# fundamentally needs. It denies unwrap/expect/panic/todo like every other
+# crate, and every unsafe block carries a SAFETY comment.

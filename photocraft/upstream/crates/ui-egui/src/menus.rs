@@ -19,6 +19,41 @@ pub(crate) fn modal_allows(app: &PhotocraftApp, id: &str) -> bool {
 /// Top-level menus in Photoshop order.
 pub const TOP_MENUS: [&str; 10] = ["File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "View", "Window", "Help"];
 
+/// Android-specific menu actions. The port's shell drains this queue each frame
+/// and opens the Stylus Settings window or the updater. This replaces the ugly
+/// floating toolbar with proper Help/Settings menu items.
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AndroidMenuAction {
+    OpenStylusSettings,
+    CheckForUpdates,
+}
+
+/// Global queue for Android menu actions. The patched menu handlers push here;
+/// the port's shell drains it.
+#[cfg(target_os = "android")]
+pub static ANDROID_MENU_ACTIONS: std::sync::OnceLock<std::sync::Mutex<Vec<AndroidMenuAction>>> =
+    std::sync::OnceLock::new();
+
+/// Push an Android menu action (called from menu command handlers).
+#[cfg(target_os = "android")]
+pub fn push_android_menu_action(action: AndroidMenuAction) {
+    let queue = ANDROID_MENU_ACTIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut q) = queue.lock() {
+        q.push(action);
+    }
+}
+
+/// Drain pending Android menu actions (called by the port shell each frame).
+#[cfg(target_os = "android")]
+pub fn drain_android_menu_actions() -> Vec<AndroidMenuAction> {
+    let queue = ANDROID_MENU_ACTIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    queue
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
+
 /// UI-level commands (handled by the shell rather than the engine): id, label, menu, shortcut.
 /// The table is the engine's ([`photocraft_engine::shell_commands::SHELL_COMMANDS`]), so the
 /// commands and their keys exist without this UI (headless shortcut sets, lists, conflicts).
@@ -337,6 +372,16 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
             Ok(Value::Null)
         }
         "help.about" => Ok(json!({"dialog": app.ui.open_dialog(DialogKind::About, Default::default())})),
+        #[cfg(target_os = "android")]
+        "help.checkUpdates" => {
+            push_android_menu_action(AndroidMenuAction::CheckForUpdates);
+            Ok(Value::Null)
+        }
+        #[cfg(target_os = "android")]
+        "edit.stylusSettings" => {
+            push_android_menu_action(AndroidMenuAction::OpenStylusSettings);
+            Ok(Value::Null)
+        }
         "help.systemInfo" => {
             let mut fields = serde_json::Map::new();
             fields.insert("systemInfo".into(), json!(true));
@@ -698,6 +743,8 @@ pub fn is_enabled(app: &PhotocraftApp, id: &str) -> bool {
         "window.panel.activate" | "window.panel.layout" => true,
         "window.panel.group" | "window.panel.move" | "window.panel.float" | "window.panel.dock" | "window.panel.close" => !app.session.prefs().workspace_locked,
         "file.open" | "file.exit" | "file.clearRecent" | "file.removeRecent" | "help.about" | "help.systemInfo" | "edit.search" => true,
+        #[cfg(target_os = "android")]
+        "help.checkUpdates" | "edit.stylusSettings" => true,
         i if i.starts_with("file.openRecent.") => true,
         i if i.starts_with(DOCUMENT_ITEM) => true,
         i if crate::links::url_for(i).is_some() => true,
@@ -1036,6 +1083,40 @@ pub fn menu_items(app: &PhotocraftApp) -> Vec<MenuItem> {
             at,
             MenuItem { id: "---".into(), label: "---".into(), path: vec!["Help".into()], shortcut: None, enabled: false, checked: None, color: None },
         );
+    }
+    // Android: Check for Updates under Help, Stylus Settings under Edit.
+    // These replace the floating toolbar buttons.
+    #[cfg(target_os = "android")]
+    {
+        if let Some(at) = items.iter().position(|i| i.id == "help.about") {
+            items.insert(
+                at,
+                MenuItem {
+                    id: "help.checkUpdates".into(),
+                    label: "Check for Updates".into(),
+                    path: vec!["Help".into()],
+                    shortcut: None,
+                    enabled: true,
+                    checked: None,
+                    color: None,
+                },
+            );
+        }
+        // Stylus Settings under Edit menu (near Preferences)
+        if let Some(at) = items.iter().rposition(|i| i.path.first().map(String::as_str) == Some("Edit")) {
+            items.insert(
+                at + 1,
+                MenuItem {
+                    id: "edit.stylusSettings".into(),
+                    label: "Stylus Settings…".into(),
+                    path: vec!["Edit".into()],
+                    shortcut: None,
+                    enabled: true,
+                    checked: None,
+                    color: None,
+                },
+            );
+        }
     }
     // Window: the open documents in tab order, after a separator, the active one checked.
     if let Some(last) = items.iter().rposition(|i| i.path.first().map(String::as_str) == Some("Window")) {

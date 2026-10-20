@@ -679,7 +679,7 @@ impl crate::PdfCraftApp {
             Some(p) if p.ends_with(".png") || p.ends_with(".jpg") => read(self, p.into()),
             Some(_) => {}
             None => {
-                let dialog = rfd::AsyncFileDialog::new()
+                let dialog = crate::rfd::AsyncFileDialog::new()
                     .add_filter(tl!("Images"), &["png", "jpg", "jpeg", "tif", "tiff", "gif", "bmp", "jp2", "j2k", "jpx"])
                     .set_title(title);
                 let target = self.active_ids().map(|(_, id)| id);
@@ -737,7 +737,9 @@ impl crate::PdfCraftApp {
         }
         let Some(pixels) = self.session.get(id).map(|d| d.page_image_rgba(page, index)) else { return false };
         let copied = pixels.and_then(|(w, h, rgba)| {
-            #[cfg(not(target_arch = "wasm32"))]
+            // Desktop only: arboard has no Android backend. On Android the
+            // image stays in the in-app clipboard (`last_copied_image`).
+            #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
             if self.system_clipboard {
                 let img = arboard::ImageData { width: w as usize, height: h as usize, bytes: std::borrow::Cow::Borrowed(&rgba) };
                 arboard::Clipboard::new().and_then(|mut c| c.set_image(img)).map_err(|e| e.to_string())?;

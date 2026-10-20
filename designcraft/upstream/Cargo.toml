@@ -116,6 +116,9 @@ debug = 0
 
 # Opt-in cancelable macOS termination on the pinned winit 0.30 line.
 [patch.crates-io]
+# ANDROID-PORT: the vendored android-activity with the CraftApps stylus patch.
+# See photocraft/upstream/Cargo.toml for the full note.
+android-activity = { path = "../../vendor/android-activity" }
 winit = { git = "https://github.com/skylartaylor/winit.git", rev = "3d51077fd1a966f84df9ef287839dc84fd5b4ca7" }
 krilla = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8", version = "=0.8.2" }
 # The hayro crates from pdfcraft's vendor/ directory, with the patches its README lists.

@@ -189,17 +189,21 @@ fn add_flags(env: &mut Env, intent: &JObject, flags: i32) -> JniResult<()> {
 }
 
 fn start_activity_for_result(env: &mut Env, activity: &JObject, intent: &JObject, code: i32) -> JniResult<()> {
-    // `startActivityForResult` exists only on `Activity`; `activity` is the
-    // bridge's ref to the app's `<App>Activity` (the very object ndk-context
-    // hands us), so call its `launchForResult` directly. Never resolve the
-    // activity with `find_class` here: from a thread attached with
-    // `AttachCurrentThread`, Android's FindClass cannot see app classes and
-    // fails with "class not found or linkage error" (found on hardware).
-    env.call_method(
-        activity,
+    // `startActivityForResult` must run on the UI thread. The Rust side calls
+    // from the eframe render thread, so we route through a static Java helper
+    // `launchForResult(Activity, Intent, int)` which does `runOnUiThread`.
+    // Static method lookup via get_object_class works reliably; the previous
+    // instance-method approach failed with "Method not found" on hardware.
+    let cls = env.get_object_class(activity)?;
+    env.call_static_method(
+        &cls,
         jni_str!("launchForResult"),
-        jni_sig!("(Landroid/content/Intent;I)V"),
-        &[JValue::from(intent), JValue::from(code)],
+        jni_sig!("(Landroid/app/Activity;Landroid/content/Intent;I)V"),
+        &[
+            JValue::from(activity),
+            JValue::from(intent),
+            JValue::from(code),
+        ],
     )?;
     Ok(())
 }
@@ -207,45 +211,19 @@ fn start_activity_for_result(env: &mut Env, activity: &JObject, intent: &JObject
 /// System file picker (`ACTION_OPEN_DOCUMENT`). `mime_types` may be empty
 /// (no filter).
 pub fn launch_open_document(multiple: bool, mime_types: &[String]) -> Result<(), String> {
-    with_env(|env, activity| {
-        let intent = new_intent(env, ACTION_OPEN_DOCUMENT)?;
-        add_category(env, &intent, CATEGORY_OPENABLE)?;
-        let type_j = jstring(env, "*/*")?;
-        env.call_method(
-            &intent,
-            jni_str!("setType"),
-            jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
-            &[JValue::from(&type_j)],
-        )?;
-        if !mime_types.is_empty() {
-            put_extra_mime_types(env, &intent, mime_types)?;
-        }
-        if multiple {
-            put_extra_bool(env, &intent, EXTRA_ALLOW_MULTIPLE, true)?;
-        }
-        add_flags(env, &intent, FLAG_GRANT_READ | FLAG_GRANT_PERSISTABLE)?;
-        start_activity_for_result(env, activity, &intent, REQ_OPEN_DOCUMENT)?;
-        Ok(())
-    })
+    // Use the file-based picker bridge (no JNI). The Activity polls for
+    // request.json and launches the picker directly.
+    // Note: multiple selection not yet supported via bridge; single file only.
+    let _ = multiple;
+    crate::picker_bridge::request_picker("open", mime_types.to_vec(), String::new())
+        .map(|_| ())
 }
 
 /// System save picker (`ACTION_CREATE_DOCUMENT`) with a suggested file name.
 pub fn launch_create_document(name: &str, mime: &str) -> Result<(), String> {
-    with_env(|env, activity| {
-        let intent = new_intent(env, ACTION_CREATE_DOCUMENT)?;
-        add_category(env, &intent, CATEGORY_OPENABLE)?;
-        let mime_j = jstring(env, mime)?;
-        env.call_method(
-            &intent,
-            jni_str!("setType"),
-            jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
-            &[JValue::from(&mime_j)],
-        )?;
-        put_extra_string(env, &intent, EXTRA_TITLE, name)?;
-        add_flags(env, &intent, FLAG_GRANT_READ | FLAG_GRANT_WRITE | FLAG_GRANT_PERSISTABLE)?;
-        start_activity_for_result(env, activity, &intent, REQ_CREATE_DOCUMENT)?;
-        Ok(())
-    })
+    // Use the file-based picker bridge (no JNI).
+    let _ = mime;
+    crate::picker_bridge::request_picker("save", vec![], name.to_string()).map(|_| ())
 }
 
 /// System folder picker for the SD-card media location.

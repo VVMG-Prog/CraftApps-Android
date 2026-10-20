@@ -630,7 +630,7 @@ impl PdfCraftApp {
                 (SaveTarget::InPlace, Some(p), _) if !is_mail_temp_copy(&p) => p,
                 _ => {
                     let name = if name.to_ascii_lowercase().ends_with(".pdf") { name } else { format!("{name}.pdf") };
-                    let dialog = rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(name);
+                    let dialog = crate::rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(name);
                     // The bytes are taken once the user has chosen, so edits made meanwhile are saved too.
                     self.ask_one(crate::pickers::Ask::Save(dialog), None, move |app, dest| {
                         app.save_doc_to_then(id, &dest.to_string_lossy(), target, Box::new(after));
@@ -1015,6 +1015,13 @@ pub(crate) fn is_mail_temp_copy(path: &str) -> bool {
 /// Write via a temporary file in the same directory and rename over the target, so a crash or
 /// full disk never leaves a half-written PDF where the original was.
 pub fn write_atomically(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    // Android: save picks come back as SAF `content://` URIs, which `std::fs`
+    // can't write. Route them through the shared SAF writer.
+    #[cfg(target_os = "android")]
+    if path.starts_with("content://") {
+        return craftapps_shared::saf::saf_write_uri(path, bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+    }
     write_atomically_with(path, bytes, staging_suffixes())
 }
 

@@ -1,9 +1,9 @@
 //! Native file pickers that never block the frame.
 //!
-//! A blocking `rfd::FileDialog` runs `-[NSOpenPanel runModal]` on macOS: a nested run loop inside
+//! A blocking `crate::rfd::FileDialog` runs `-[NSOpenPanel runModal]` on macOS: a nested run loop inside
 //! winit's event handler. An event that arrives while it spins re-enters the handler, winit
 //! panics, and because the panic can't unwind out of the AppKit callback the app aborts.
-//! `rfd::AsyncFileDialog` returns at once instead, and the app uses the choice on a later frame
+//! `crate::rfd::AsyncFileDialog` returns at once instead, and the app uses the choice on a later frame
 //! ([`PdfCraftApp::process_picked`]); a worker thread waits for it.
 //!
 //! How rfd 0.17 shows the panel (checked against its source):
@@ -45,13 +45,34 @@ pub enum PickFor {
 /// Which native panel to show.
 pub(crate) enum Ask {
     /// Choose one existing file.
-    File(rfd::AsyncFileDialog),
+    File(crate::rfd::AsyncFileDialog),
     /// Choose one or more existing files.
-    Files(rfd::AsyncFileDialog),
+    Files(crate::rfd::AsyncFileDialog),
     /// Choose a folder.
-    Folder(rfd::AsyncFileDialog),
+    Folder(crate::rfd::AsyncFileDialog),
     /// Choose where to save a file.
-    Save(rfd::AsyncFileDialog),
+    Save(crate::rfd::AsyncFileDialog),
+    /// Choose an output folder. On desktop this behaves exactly like
+    /// [`Ask::Folder`]; on Android it resolves deterministically to the
+    /// shell's output directory (a SAF tree URI can't be written with
+    /// `std::fs`, so no system picker is shown).
+    #[cfg(target_os = "android")]
+    FolderOut(crate::rfd::AsyncFileDialog),
+}
+
+impl Ask {
+    /// Build the folder variant for batch *output* (exports, OCR results):
+    /// a real picker on desktop, the shell's output directory on Android.
+    pub(crate) fn folder_out(dialog: crate::rfd::AsyncFileDialog) -> Self {
+        #[cfg(not(target_os = "android"))]
+        {
+            Ask::Folder(dialog)
+        }
+        #[cfg(target_os = "android")]
+        {
+            Ask::FolderOut(dialog)
+        }
+    }
 }
 
 /// What to do with the chosen paths, on a later frame.
@@ -155,7 +176,7 @@ impl Pickers {
 impl PdfCraftApp {
     /// Show a native picker for `pick_for` without blocking the frame. The choice is used on a
     /// later frame by [`Self::process_picked`].
-    pub(crate) fn pick(&mut self, pick_for: PickFor, dialog: rfd::AsyncFileDialog, multiple: bool) {
+    pub(crate) fn pick(&mut self, pick_for: PickFor, dialog: crate::rfd::AsyncFileDialog, multiple: bool) {
         // Insert and Replace edit the active document: remember which one.
         let target = match pick_for {
             PickFor::Files(purpose) if purpose.edits_active_document() => self.active_ids().map(|(_, id)| id),
@@ -192,8 +213,21 @@ impl PdfCraftApp {
         }
         // On macOS creating the future shows the panel; it must happen here, on the main thread.
         let ctx = self.ctx.clone();
-        let one = |h: Option<rfd::FileHandle>| h.map(|h| h.path().to_path_buf()).into_iter().collect::<Vec<_>>();
+        let one = |h: Option<crate::rfd::FileHandle>| h.map(|h| h.path().to_path_buf()).into_iter().collect::<Vec<_>>();
         let started = match ask {
+            // Android output folders resolve deterministically: a SAF tree
+            // URI can't be written with `std::fs`, so no picker is shown.
+            // The user is told where the files went.
+            #[cfg(target_os = "android")]
+            Ask::FolderOut(_d) => {
+                let dir = crate::android::output_dir("exports");
+                self.notify_fmt(
+                    "Saving to {dir}",
+                    &[("dir", &dir.display().to_string())],
+                );
+                self.pickers.deliver(target, vec![dir], then);
+                true
+            }
             Ask::File(d) => {
                 let pick = d.pick_file();
                 self.pickers.spawn(target, ctx, async move { one(pick.await) }, then)
@@ -365,7 +399,7 @@ mod tests {
         app.pickers.showing.store(true, Ordering::SeqCst);
         let got = Arc::new(Mutex::new(Vec::new()));
         let into = got.clone();
-        assert!(!app.ask(Ask::File(rfd::AsyncFileDialog::new()), None, move |_, paths| into.lock().unwrap().extend(paths)));
+        assert!(!app.ask(Ask::File(crate::rfd::AsyncFileDialog::new()), None, move |_, paths| into.lock().unwrap().extend(paths)));
         app.process_picked();
         assert!(got.lock().unwrap().is_empty());
         assert!(app.pickers.showing.load(Ordering::SeqCst), "the showing picker still owns the flag");
@@ -378,12 +412,12 @@ mod tests {
         app.pick_override = Some(vec!["first.fdf".into()]);
         let got = Arc::new(Mutex::new(Vec::new()));
         let into = got.clone();
-        assert!(app.ask(Ask::Files(rfd::AsyncFileDialog::new()), None, move |app, _| {
+        assert!(app.ask(Ask::Files(crate::rfd::AsyncFileDialog::new()), None, move |app, _| {
             // Merge data: the spreadsheet's save picker, asked from the first pick's closure.
-            assert!(app.ask(Ask::Save(rfd::AsyncFileDialog::new()), None, move |_, paths| into.lock().unwrap().extend(paths)));
+            assert!(app.ask(Ask::Save(crate::rfd::AsyncFileDialog::new()), None, move |_, paths| into.lock().unwrap().extend(paths)));
         }));
         // Another command asks for a picker before the frame uses the first pick: refused.
-        assert!(!app.ask(Ask::File(rfd::AsyncFileDialog::new()), None, |_, _| panic!("must not run")));
+        assert!(!app.ask(Ask::File(crate::rfd::AsyncFileDialog::new()), None, |_, _| panic!("must not run")));
         app.process_picked();
         app.process_picked();
         assert_eq!(*got.lock().unwrap(), vec![PathBuf::from("first.fdf")], "the chained picker answered");

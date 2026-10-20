@@ -15,6 +15,9 @@ keystore/
 target/
 **/target/
 
+# Vendored dependencies (build artefacts: see scripts/vendor-*.sh)
+vendor/
+
 # Gradle
 .gradle/
 local.properties

@@ -4,12 +4,26 @@ Each app's `upstream/` checkout carries small Android-specific patches that must
 be re-applied when re-pinning to a new upstream tag. The port crate
 (`apps/<app>-android/`) is untracked by upstream git and survives checkouts.
 
+The shared crate (`shared/`) and the Gradle project (`<app>/android/`) are
+outside the upstream checkout, so they survive a re-pin untouched.
+
+**The 0.4.0 fixes need no new upstream patches** — the gesture detection, the
+modifier tracking and the picker bridge all live in the port crate and the
+shared crate. See `docs/fixes-0.4.0.md`.
+
 ## PhotoCraft (`photocraft/upstream`)
 1. `xtask/src/layers.rs` — register `("android", Class::Exempt)` (one line)
 2. `crates/ui-egui/Cargo.toml` — gate eframe's `accesskit` feature off on Android
    (compile error with android-native-activity)
 3. `crates/ui-egui/src/view_cmds.rs` — `ViewOptions::hides_chrome()`: cfg-gated to
    return `false` on Android (menu bar always visible, incl. DeX windowed mode)
+4. `Cargo.toml` (workspace root) — `[patch.crates-io] android-activity = { path =
+   "../../vendor/android-activity" }`: the vendored android-activity with the
+   CraftApps stylus patch (the S Pen's side button and the tool type).
+   `scripts/vendor-android-activity.sh` recreates the vendored copy from the
+   cargo registry and applies `patches/android-activity-0.6.1-stylus.patch`;
+   `scripts/build-apk.sh` runs it. The vendored copy is a build artefact and
+   is **not** committed. See `docs/fixes-0.4.1.md`.
 
 ## DesignCraft (`designcraft/upstream`)
 1. `xtask/src/layers.rs` — android exempt registration (check exact line)
