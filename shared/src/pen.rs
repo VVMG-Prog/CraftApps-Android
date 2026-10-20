@@ -209,7 +209,12 @@ impl PressureCurve {
 
 /// Pen settings, persisted per-app as `pen.json` under the app's settings dir
 /// (`/sdcard/CraftApps/Settings/<App>/`).
+///
+/// `#[serde(default)]`: a file written by an older build (before a setting
+/// existed) must not lose the settings it does have — the missing field falls
+/// back to its default instead of failing the whole parse.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PenSettings {
     pub pressure_enabled: bool,
     pub pressure_curve: PressureCurve,
@@ -353,6 +358,16 @@ struct PenRuntime {
     palm_down: bool,
     /// Stylus currently touching (Java side-channel).
     stylus_down: bool,
+    /// The stylus is hovering over the screen but not touching it (the
+    /// hover events: `ACTION_HOVER_ENTER` / `_MOVE` / `_EXIT`). A stylus'
+    /// side button is reported on those events too, so the button works
+    /// while the pen hovers.
+    hovering: bool,
+    /// The last position the stylus reported (used by the key-event path).
+    x: f32,
+    y: f32,
+    /// The last motion event seen: (action, button bits, tool type).
+    last_event: Option<(i32, i32, i32)>,
     /// Learned winit device id hash for the pen (S Pen is a separate input
     /// device on Samsung tablets). `None` until observed.
     pen_device: Option<u64>,
@@ -387,6 +402,10 @@ fn runtime() -> &'static Mutex<PenRuntime> {
             pressed: [false; 3],
             palm_down: false,
             stylus_down: false,
+            hovering: false,
+            x: 0.0,
+            y: 0.0,
+            last_event: None,
             pen_device: None,
             capture: None,
             captured: None,
@@ -430,6 +449,13 @@ pub fn on_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32, x:
     const ACTION_DOWN: i32 = 0;
     const ACTION_UP: i32 = 1;
     const ACTION_CANCEL: i32 = 3;
+    const ACTION_MOVE: i32 = 2;
+    // The hover actions. Android's numbering changed over the releases
+    // (hover move is 7, hover enter 9, hover exit 10 today; 7/8/9 in the
+    // older ones), so all of them count as "hovering".
+    const ACTION_HOVER_MOVE: i32 = 7;
+    const ACTION_HOVER_ENTER: i32 = 9;
+    const ACTION_HOVER_EXIT: i32 = 10;
     const TOOL_STYLUS: i32 = 2;
     const TOOL_ERASER: i32 = 4;
     const TOOL_PALM: i32 = 5;
@@ -437,6 +463,12 @@ pub fn on_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32, x:
     const BUTTON_STYLUS_SECONDARY: i32 = 1 << 6;
 
     let Ok(mut rt) = runtime().lock() else { return };
+
+    // Remember where the stylus is and what the last event was: the key-event
+    // path needs the position, and the Stylus Settings show the event.
+    rt.x = x;
+    rt.y = y;
+    rt.last_event = Some((action, buttons, tool));
 
     // Tool tracking.
     rt.tool = match tool {
@@ -446,26 +478,46 @@ pub fn on_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32, x:
         1 => PenTool::Finger,
         _ => PenTool::Unknown,
     };
-    rt.palm_down = tool == TOOL_PALM && (action == ACTION_DOWN || action == 2 /* MOVE */);
+
+    // Hovering: the stylus is over the screen but not touching it. Its side
+    // button is reported on the hover events as well, so the button works
+    // while the pen hovers.
+    let hovering = matches!(action, ACTION_HOVER_MOVE | ACTION_HOVER_ENTER | ACTION_HOVER_EXIT);
+    if hovering {
+        // ACTION_HOVER_EXIT means the pen *left* the screen: the flag must go
+        // off, not on.
+        rt.hovering = action != ACTION_HOVER_EXIT;
+    }
+
+    rt.palm_down = tool == TOOL_PALM && (action == ACTION_DOWN || action == ACTION_MOVE);
     if action == ACTION_UP || action == ACTION_CANCEL {
         rt.palm_down = false;
+        rt.hovering = false;
         if tool == TOOL_STYLUS || tool == TOOL_ERASER {
             rt.stylus_down = false;
         }
     }
     if action == ACTION_DOWN && (tool == TOOL_STYLUS || tool == TOOL_ERASER) {
         rt.stylus_down = true;
+        // Touching the screen ends the hover.
+        rt.hovering = false;
     }
 
     // Eraser end: tool-type transition acts like a button.
-    let eraser_now = tool == TOOL_ERASER && (action == ACTION_DOWN || action == 2);
+    let eraser_now = tool == TOOL_ERASER && (action == ACTION_DOWN || action == ACTION_MOVE);
     set_button(&mut rt, PenButton::Eraser, eraser_now, x, y);
 
-    // Barrel buttons: transitions via ACTION_BUTTON_PRESS/RELEASE, or the
-    // held state on DOWN/MOVE.
+    // Barrel buttons: the held state is carried by *every* event while the
+    // button is held (`MotionEvent.getButtonState()`), so use it for every
+    // action — including the hover events, where the button press arrives
+    // while the pen is not touching the screen.
     let primary_held = buttons & BUTTON_STYLUS_PRIMARY != 0;
     let secondary_held = buttons & BUTTON_STYLUS_SECONDARY != 0;
+    set_button(&mut rt, PenButton::BarrelPrimary, primary_held, x, y);
+    set_button(&mut rt, PenButton::BarrelSecondary, secondary_held, x, y);
     if action == ACTION_BUTTON_PRESS {
+        // A button press that does not set the button bits (some devices
+        // report the button only through the action).
         if action_button == BUTTON_STYLUS_PRIMARY {
             set_button(&mut rt, PenButton::BarrelPrimary, true, x, y);
         } else if action_button == BUTTON_STYLUS_SECONDARY {
@@ -477,9 +529,6 @@ pub fn on_pen_event(action: i32, tool: i32, buttons: i32, action_button: i32, x:
         } else if action_button == BUTTON_STYLUS_SECONDARY {
             set_button(&mut rt, PenButton::BarrelSecondary, false, x, y);
         }
-    } else {
-        set_button(&mut rt, PenButton::BarrelPrimary, primary_held, x, y);
-        set_button(&mut rt, PenButton::BarrelSecondary, secondary_held, x, y);
     }
 
     // Lift/cancel clears everything: a pen that leaves the screen cannot be
@@ -587,9 +636,154 @@ pub fn drain_actions() -> Vec<QueuedAction> {
         .unwrap_or_default()
 }
 
+/// A stylus' side button press or release that arrived as a **key event**.
+///
+/// Android 14 and later also report the stylus' buttons as key events
+/// (`KEYCODE_STYLUS_BUTTON_PRIMARY` = 308, `..._SECONDARY` = 309); winit maps
+/// those to `Key::Unidentified(308)`, so the port can pick them up there.
+/// The position is the last one the stylus reported.
+pub fn on_pen_button(button: PenButton, pressed: bool) {
+    let Ok(mut rt) = runtime().lock() else { return };
+    let (x, y) = (rt.x, rt.y);
+    set_button(&mut rt, button, pressed, x, y);
+}
+
+/// The last motion event the runtime saw: (action, button bits, tool type).
+/// A diagnostic for the Stylus Settings.
+pub fn last_event() -> Option<(i32, i32, i32)> {
+    runtime().lock().ok().and_then(|rt| rt.last_event)
+}
+
+/// The last raw stylus state the shell drained from the Android input
+/// queue, BEFORE any filtering: (action, button bits, action button,
+/// tool type). A diagnostic for the Stylus Settings: it separates "the OS
+/// never delivered the event" from "the app received and dropped it".
+static LAST_QUEUE_STATE: std::sync::Mutex<Option<(i32, u32, i32, i32)>> =
+    std::sync::Mutex::new(None);
+
+/// Record a raw drained stylus state. The shell calls this for every
+/// state it drains, before deciding whether the pen runtime should see
+/// it.
+pub fn note_queue_state(action: i32, buttons: u32, action_button: i32, tool: i32) {
+    if let Ok(mut slot) = LAST_QUEUE_STATE.lock() {
+        *slot = Some((action, buttons, action_button, tool));
+    }
+}
+
+/// The last raw stylus state the shell drained (see [`note_queue_state`]).
+pub fn last_queue_state() -> Option<(i32, u32, i32, i32)> {
+    LAST_QUEUE_STATE.lock().ok().and_then(|slot| *slot)
+}
+
+// ---------------------------------------------------------------------------
+// Input pump: keep pen-button events from starving.
+//
+// The vendored android-activity pump RECORDS stylus states as events pass
+// through winit's input iterator -- including barrel-button presses while
+// hovering. But eframe only runs a frame when egui has something to react
+// to, and a stylus button press produces no egui event: over the canvas
+// the app sits idle, the recorded press is never drained, and nothing
+// happens until the next touch wakes the app and the stale press fires
+// then. (In the Stylus Settings the capture polling repaints every frame,
+// which is why presses are seen there.)
+//
+// The pump thread moves recorded states into a holding queue and, when a
+// state carries a button transition, asks egui for a repaint so the
+// shell drains and dispatches it immediately.
+
+static PUMP_CTX: std::sync::Mutex<Option<egui::Context>> = std::sync::Mutex::new(None);
+static PUMP_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static QUEUED_STATES: std::sync::Mutex<
+    std::collections::VecDeque<android_activity::input::StylusState>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Max states buffered while the app is not draining (e.g. backgrounded);
+/// the oldest are dropped beyond this, mirroring the input queue's cap.
+const QUEUED_STATES_CAP: usize = 512;
+
+/// Start the pen input pump (idempotent) and give it the egui context to
+/// wake when a pen-button event lands. Call from the shell each frame;
+/// only the first call spawns the thread.
+pub fn install_pen_pump(ctx: egui::Context) {
+    if let Ok(mut slot) = PUMP_CTX.lock() {
+        *slot = Some(ctx);
+    }
+    if PUMP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("pen-input-pump".into())
+        .spawn(pump_loop);
+    if let Err(e) = spawned {
+        log::error!("pen input pump failed to start: {e}");
+        PUMP_STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Is the pen input pump running? Shells drain [`take_queued_states`]
+/// when it is, and the android-activity queue directly when it is not.
+pub fn pen_pump_active() -> bool {
+    PUMP_STARTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn pump_loop() {
+    loop {
+        let states = android_activity::input::drain_stylus_states();
+        if !states.is_empty() {
+            let mut wake = false;
+            if let Ok(mut queue) = QUEUED_STATES.lock() {
+                for state in states {
+                    note_queue_state(
+                        state.action,
+                        state.buttons,
+                        state.action_button as i32,
+                        state.tool_type,
+                    );
+                    // A button transition (press/release action, or any
+                    // state carrying button bits) must not wait for the
+                    // next touch: wake the app so it dispatches it now.
+                    if state.action == 11 || state.action == 12 || state.buttons != 0 {
+                        wake = true;
+                    }
+                    if queue.len() >= QUEUED_STATES_CAP {
+                        queue.pop_front();
+                    }
+                    queue.push_back(state);
+                }
+            }
+            if wake {
+                if let Ok(slot) = PUMP_CTX.lock() {
+                    if let Some(ctx) = slot.as_ref() {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Take the stylus states the pump collected, oldest first. Shells that
+/// installed the pump drain THIS instead of the android-activity queue.
+pub fn take_queued_states() -> Vec<android_activity::input::StylusState> {
+    QUEUED_STATES
+        .lock()
+        .map(|mut queue| queue.drain(..).collect())
+        .unwrap_or_default()
+}
+
 /// Is the stylus currently touching? (Java side-channel.)
 pub fn stylus_down() -> bool {
     runtime().lock().map(|rt| rt.stylus_down).unwrap_or(false)
+}
+
+/// Is the stylus hovering over the screen (near it, not touching)?
+///
+/// The stylus' side button is reported on the hover events as well, so the
+/// button works while the pen hovers.
+pub fn hovering() -> bool {
+    runtime().lock().map(|rt| rt.hovering).unwrap_or(false)
 }
 
 /// Is a palm currently down? (Java side-channel; winit drops this.)
@@ -688,6 +882,40 @@ pub fn pen_settings_ui(
         dot(ui, "Secondary", secondary);
         dot(ui, "Eraser", eraser);
     });
+    // Hover: the pen is near the screen without touching it. The side
+    // button is reported on the hover events too, so it works there as well.
+    {
+        let hovering = hovering();
+        let color = if hovering { egui::Color32::GREEN } else { egui::Color32::DARK_GRAY };
+        ui.colored_label(color, format!("● Pen hovering ({hovering})"));
+    }
+    // The last event the stylus sent: (action, button bits, tool type).
+    // The diagnostic for "the button does nothing": the action shows which
+    // event arrived, the bits whether the button was held with it.
+    match last_event() {
+        Some((action, buttons, tool)) => {
+            ui.label(format!(
+                "Last stylus event: action {action}, buttons 0x{buttons:02x}, tool {tool}"
+            ));
+        }
+        None => {
+            ui.label("Last stylus event: none yet");
+        }
+    }
+    // The last raw state the Android input queue delivered, before the
+    // shell's filtering: if a hover button press shows up here but the
+    // dots above stay dark, the app is dropping it; if nothing shows up
+    // here either, the OS never delivered it.
+    match last_queue_state() {
+        Some((action, buttons, action_button, tool)) => {
+            ui.label(format!(
+                "Last input from Android: action {action}, buttons 0x{buttons:02x}, action button {action_button}, tool {tool}"
+            ));
+        }
+        None => {
+            ui.label("Last input from Android: none yet");
+        }
+    }
     ui.add_space(4.0);
 
     ui.label("Pressure");
@@ -917,5 +1145,23 @@ mod tests {
         let back: PenSettings = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.sensitivity, s.sensitivity);
         assert_eq!(back.button_primary, s.button_primary);
+    }
+
+    #[test]
+    fn the_side_button_works_while_the_pen_hovers() {
+        // A hover event (ACTION_HOVER_MOVE = 7) with the stylus' button held
+        // (BUTTON_STYLUS_PRIMARY = 1 << 5).
+        const ACTION_HOVER_MOVE: i32 = 7;
+        const TOOL_STYLUS: i32 = 2;
+        const BUTTON_STYLUS_PRIMARY: i32 = 1 << 5;
+
+        on_pen_event(ACTION_HOVER_MOVE, TOOL_STYLUS, BUTTON_STYLUS_PRIMARY, 0, 10.0, 20.0);
+        assert!(hovering(), "the pen is hovering");
+        assert!(button_state().0, "the button is held while hovering");
+        assert!(!stylus_down(), "the pen is not touching");
+
+        // Released: the button is let go.
+        on_pen_event(ACTION_HOVER_MOVE, TOOL_STYLUS, 0, 0, 10.0, 20.0);
+        assert!(!button_state().0, "the button is released");
     }
 }

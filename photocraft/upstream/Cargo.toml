@@ -167,3 +167,18 @@ opt-level = "z"
 [profile.wasm-release.package.photocraft-paint]
 opt-level = 3
 
+# ANDROID-PORT: the vendored android-activity with the CraftApps stylus patch.
+#
+# The S Pen's side button and the tool type (eraser end, palm) live in the
+# MotionEvent — the one piece of input data winit drops. On the Galaxy Tab S6
+# Lite the button is reported by *replacing* the motion action with a
+# proprietary one (211/213/212/214), which the NDK maps to
+# `MotionAction::__Unknown`; winit then drops the whole event, so the stroke
+# even stops while the button is held.
+#
+# The patch lives in ../../patches/android-activity-0.6.1-stylus.patch and is
+# applied by ../../scripts/vendor-android-activity.sh, which vendors the crate
+# from the cargo registry (the vendored copy is a build artefact, not part of
+# the repository).
+[patch.crates-io]
+android-activity = { path = "../../vendor/android-activity" }

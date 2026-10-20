@@ -8,8 +8,10 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod gestures;
 pub mod gpu;
 pub mod jni_bridge;
+pub mod modifiers;
 pub mod pen;
 pub mod picker_bridge;
 pub mod saf;

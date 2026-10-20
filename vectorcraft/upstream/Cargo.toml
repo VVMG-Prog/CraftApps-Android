@@ -125,6 +125,9 @@ lto = "thin"
 codegen-units = 1
 
 [patch.crates-io]
+# ANDROID-PORT: the vendored android-activity with the CraftApps stylus patch.
+# See photocraft/upstream/Cargo.toml for the full note.
+android-activity = { path = "../../vendor/android-activity" }
 hayro-syntax = { git = "https://github.com/storytold/craft-libs", rev = "ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d" }
 hayro-interpret = { git = "https://github.com/storytold/craft-libs", rev = "ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d" }
 hayro-jbig2 = { git = "https://github.com/storytold/craft-libs", rev = "ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d" }

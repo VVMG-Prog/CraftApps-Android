@@ -52,13 +52,7 @@ const REQ_OPEN_DOCUMENT_TREE: i32 = 103;
 const RESULT_OK: i32 = -1;
 
 // Intent contract literals (android.content.Intent / android.provider.DocumentsContract).
-const ACTION_OPEN_DOCUMENT: &str = "android.intent.action.OPEN_DOCUMENT";
-const ACTION_CREATE_DOCUMENT: &str = "android.intent.action.CREATE_DOCUMENT";
 const ACTION_OPEN_DOCUMENT_TREE: &str = "android.intent.action.OPEN_DOCUMENT_TREE";
-const CATEGORY_OPENABLE: &str = "android.intent.category.OPENABLE";
-const EXTRA_MIME_TYPES: &str = "android.intent.extra.MIME_TYPES";
-const EXTRA_ALLOW_MULTIPLE: &str = "android.intent.extra.ALLOW_MULTIPLE";
-const EXTRA_TITLE: &str = "android.intent.extra.TITLE";
 // Intent flags (android.content.Intent; stable since API 1/19).
 const FLAG_GRANT_READ: i32 = 0x1;
 const FLAG_GRANT_WRITE: i32 = 0x2;
@@ -103,6 +97,63 @@ pub fn cancel_pending() {
     }
 }
 
+/// Poll the file bridge for a response and answer the pending SAF request.
+///
+/// The launchers above (`launch_open_document`, `launch_create_document`,
+/// `launch_open_document_tree_bridge`) hand the pick to the Java side through
+/// the file bridge; the answer comes back as a response file, not through
+/// `onActivityResult`. Each port calls this once per frame while a picker
+/// may be in flight (PhotoCraft's file browser polls the bridge itself
+/// instead — do not call this there).
+pub fn poll_bridge() {
+    let Some(response) = crate::picker_bridge::poll_response() else { return };
+    let pending = PENDING.lock().unwrap_or_else(|poison| poison.into_inner()).take();
+    let Some(p) = pending else {
+        log::warn!("bridge response with no pending SAF request; ignoring");
+        return;
+    };
+    if response.cancelled {
+        match p.kind {
+            PendingKind::Open { reply, .. } | PendingKind::Create { reply, .. } => reply.send(None),
+            PendingKind::PickTree { reply } => { if let Some(r) = reply { r.send(None); } }
+        }
+        return;
+    }
+    match p.kind {
+        PendingKind::Open { reply, .. } => {
+            // The Java side copies picked files into the bridge inbox, so the
+            // paths are ordinary files the app can read directly.
+            if response.paths.is_empty() {
+                reply.send(None);
+            } else {
+                reply.send(Some(DialogAnswer::Paths(response.paths)));
+            }
+        }
+        PendingKind::Create { reply, .. } => {
+            match response.uri {
+                Some(uri) => {
+                    if let Some(name) = response.name.as_deref() {
+                        p.storage.record_uri_name(&uri, name);
+                    }
+                    reply.send(Some(DialogAnswer::SaveTo(uri)));
+                }
+                None => reply.send(None),
+            }
+        }
+        PendingKind::PickTree { reply } => {
+            match response.uri {
+                Some(uri) => {
+                    if let Err(e) = p.storage.set_sd_tree_uri(&uri) {
+                        log::error!("couldn't remember the SD-card folder: {e}");
+                    }
+                    if let Some(r) = reply { r.send(Some(DialogAnswer::Folder(uri))); }
+                }
+                None => { if let Some(r) = reply { r.send(None); } }
+            }
+        }
+    }
+}
+
 pub fn set_pending_open(reply: Box<dyn DialogReply>, multiple: bool, storage: Arc<StorageManager>) {
     set_pending(REQ_OPEN_DOCUMENT, PendingKind::Open { reply, multiple }, storage);
 }
@@ -124,59 +175,9 @@ fn new_intent<'a>(env: &mut Env<'a>, action: &str) -> JniResult<JObject<'a>> {
     Ok(env.new_object(&cls, jni_sig!("(Ljava/lang/String;)V"), &[JValue::from(&action_j)])?)
 }
 
-fn add_category(env: &mut Env, intent: &JObject, category: &str) -> JniResult<()> {
-    let cat_j = jstring(env, category)?;
-    env.call_method(
-        intent,
-        jni_str!("addCategory"),
-        jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
-        &[JValue::from(&cat_j)],
-    )?;
-    Ok(())
-}
 
-fn put_extra_bool(env: &mut Env, intent: &JObject, name: &str, value: bool) -> JniResult<()> {
-    let name_j = jstring(env, name)?;
-    env.call_method(
-        intent,
-        jni_str!("putExtra"),
-        jni_sig!("(Ljava/lang/String;Z)Landroid/content/Intent;"),
-        &[JValue::from(&name_j), JValue::from(value)],
-    )?;
-    Ok(())
-}
 
-fn put_extra_string(env: &mut Env, intent: &JObject, name: &str, value: &str) -> JniResult<()> {
-    let name_j = jstring(env, name)?;
-    let value_j = jstring(env, value)?;
-    env.call_method(
-        intent,
-        jni_str!("putExtra"),
-        jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;"),
-        &[JValue::from(&name_j), JValue::from(&value_j)],
-    )?;
-    Ok(())
-}
 
-fn put_extra_mime_types(env: &mut Env, intent: &JObject, types: &[String]) -> JniResult<()> {
-    let name_j = jstring(env, EXTRA_MIME_TYPES)?;
-    let arr = env.new_object_array(types.len() as i32, jni_str!("java/lang/String"), JObject::null())?;
-    for (i, t) in types.iter().enumerate() {
-        let t_j = jstring(env, t)?;
-        // `set_object_array_element` is deprecated in favour of
-        // `JObjectArray::set_element`, which has no `JString` bound — the old
-        // method is sound, so keep it until the JNI bump.
-        #[allow(deprecated)]
-        env.set_object_array_element(&arr, i, &t_j)?;
-    }
-    env.call_method(
-        intent,
-        jni_str!("putExtra"),
-        jni_sig!("(Ljava/lang/String;[Ljava/lang/String;)Landroid/content/Intent;"),
-        &[JValue::from(&name_j), JValue::from(&arr)],
-    )?;
-    Ok(())
-}
 
 fn add_flags(env: &mut Env, intent: &JObject, flags: i32) -> JniResult<()> {
     env.call_method(
@@ -211,19 +212,29 @@ fn start_activity_for_result(env: &mut Env, activity: &JObject, intent: &JObject
 /// System file picker (`ACTION_OPEN_DOCUMENT`). `mime_types` may be empty
 /// (no filter).
 pub fn launch_open_document(multiple: bool, mime_types: &[String]) -> Result<(), String> {
-    // Use the file-based picker bridge (no JNI). The Activity polls for
-    // request.json and launches the picker directly.
-    // Note: multiple selection not yet supported via bridge; single file only.
-    let _ = multiple;
-    crate::picker_bridge::request_picker("open", mime_types.to_vec(), String::new())
-        .map(|_| ())
+    // Use the file-based picker bridge (no JNI): the Activity polls for
+    // request.json and launches the picker itself on the UI thread.
+    crate::picker_bridge::request_picker(
+        crate::picker_bridge::PickerKind::Open,
+        mime_types.to_vec(),
+        String::new(),
+        multiple,
+    )
+    .map(|_| ())
 }
 
 /// System save picker (`ACTION_CREATE_DOCUMENT`) with a suggested file name.
 pub fn launch_create_document(name: &str, mime: &str) -> Result<(), String> {
-    // Use the file-based picker bridge (no JNI).
+    // Use the file-based picker bridge (no JNI). The MIME type travels in the
+    // request; the Activity falls back to the name's extension.
     let _ = mime;
-    crate::picker_bridge::request_picker("save", vec![], name.to_string()).map(|_| ())
+    crate::picker_bridge::request_picker(
+        crate::picker_bridge::PickerKind::Save,
+        vec![],
+        name.to_string(),
+        false,
+    )
+    .map(|_| ())
 }
 
 /// System folder picker for the SD-card media location.
@@ -234,6 +245,21 @@ pub fn launch_open_document_tree() -> Result<(), String> {
         start_activity_for_result(env, activity, &intent, REQ_OPEN_DOCUMENT_TREE)?;
         Ok(())
     })
+}
+
+/// System folder picker, through the file bridge (no JNI).
+///
+/// The JNI path above launches the picker from the eframe render thread,
+/// where `startActivityForResult` fails silently; the bridge has the Activity
+/// launch it on the UI thread instead.
+pub fn launch_open_document_tree_bridge() -> Result<(), String> {
+    crate::picker_bridge::request_picker(
+        crate::picker_bridge::PickerKind::Folder,
+        vec![],
+        String::new(),
+        false,
+    )
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,13 @@ android-activity = { version = "=0.6.1", features = ["native-activity"] }
 ndk-context = "=0.1.1"
 android_logger = "0.15"
 
+[dev-dependencies]
+# The host test build needs a window system: eframe without the default
+# features has none, and winit refuses to compile without one. Only the tests
+# use this — the Android build is unaffected (winit's X11 backend is desktop
+# only).
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "x11"] }
+
 # NOTE: this crate does NOT forbid unsafe: the JNI bridge fundamentally needs
 # it. Every unsafe block carries a SAFETY comment (the photocraft-tablet
 # pattern), and unwrap/expect/panic/todo are denied above.

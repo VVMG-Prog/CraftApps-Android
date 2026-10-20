@@ -4,6 +4,11 @@
 //!
 //! The Java side (`dispatchKeyEvent` override) tracks Ctrl/Shift/Alt key
 //! presses and forwards the combined bitmask here.
+//!
+//! Note: on a `NativeActivity` that Java hook never runs (the window's input
+//! queue belongs to the native side), so the live path is
+//! `craftapps_shared::modifiers`, which tracks the same keys from egui's key
+//! events. This entry stays for a future non-`NativeActivity` shell.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -11,6 +16,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 static MODIFIER_STATE: AtomicI32 = AtomicI32::new(0);
 
 /// Get the current modifier state (for the egui input handler).
+#[allow(dead_code)]
 pub fn modifier_state() -> i32 {
     MODIFIER_STATE.load(Ordering::SeqCst)
 }

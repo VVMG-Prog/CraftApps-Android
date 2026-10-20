@@ -23,6 +23,7 @@ jni = "=0.22.4"
 ndk-context = "=0.1.1"
 log = "0.4"
 android_logger = "0.15"
+serde_json = "1"
 
 # NOTE: this crate does NOT opt into the workspace lints (`unsafe_code = "deny""):
 # the JNI entries an Android shell fundamentally needs are unsafe. It denies

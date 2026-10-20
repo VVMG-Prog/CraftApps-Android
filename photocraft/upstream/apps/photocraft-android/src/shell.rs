@@ -6,6 +6,8 @@
 //! lives in this crate and is composed here.
 
 use crate::file_browser::FileBrowser;
+use craftapps_shared::gestures::GestureDetector;
+use craftapps_shared::modifiers::ModifierKeys;
 use craftapps_shared::pen::PenSettings;
 use craftapps_shared::updater::Updater;
 use eframe::egui;
@@ -28,6 +30,14 @@ pub struct AndroidShell {
     stylus_open: bool,
     /// Tool wheel popup state: (x, y) in egui points, or None if closed.
     tool_wheel: Option<egui::Pos2>,
+    /// Multi-finger tap recognition (the "stylus mode" gestures).
+    gestures: GestureDetector,
+    /// Which modifier keys are held (winit's Android backend sends no
+    /// `ModifiersChanged`, so they are tracked from the key events).
+    modifiers: ModifierKeys,
+    /// The history length at the end of the last frame, used to tell whether a
+    /// multi-finger tap painted something of its own.
+    history_len: usize,
 }
 
 impl AndroidShell {
@@ -49,6 +59,9 @@ impl AndroidShell {
             pen_config_dir,
             stylus_open: false,
             tool_wheel: None,
+            gestures: GestureDetector::new(),
+            modifiers: ModifierKeys::default(),
+            history_len: 0,
         }
     }
 
@@ -70,6 +83,111 @@ impl AndroidShell {
         if want.map(|s| s.eraser) != current_eraser || want.is_some() != current_eraser.is_some() {
             self.inner.stylus.feed.set(want);
         }
+    }
+
+    /// Multi-finger taps (the "stylus mode" gestures) and the keyboard
+    /// modifiers. Both run before the app's frame, so the app sees the
+    /// modifiers and the gesture's side effects in the same frame.
+    fn process_input(&mut self, ctx: &egui::Context) {
+        // Pen input pump: collects stylus states on its own thread and
+        // wakes the app when a pen-button event lands, so a button press
+        // while hovering dispatches immediately instead of waiting for
+        // the next touch to run a frame. Idempotent; first call starts it.
+        craftapps_shared::pen::install_pen_pump(ctx.clone());
+        // Keyboard modifiers: winit's Android backend never sends
+        // `ModifiersChanged`, so egui's modifier state is empty and every
+        // Ctrl/Shift/Alt shortcut is dead without this.
+        self.modifiers.update(ctx);
+        self.modifiers.publish(ctx);
+
+        // The stylus data of the last motion event: the tool type (stylus,
+        // eraser end, palm) and the side-button state. winit drops both, so
+        // the vendored android-activity records them on the way past.
+        self.feed_stylus_state();
+
+        // The history length before this frame's work: a multi-finger tap
+        // arrives at the canvas as a click, which can paint a dab of its own.
+        let history_now = self.inner.session.active().map(|st| st.history.past_len()).unwrap_or(0);
+        let history_before = self.history_len;
+        self.history_len = history_now;
+
+        if let Some(tap) = self.gestures.update(ctx) {
+            // Undo whatever the tap itself painted, so the gesture is the only
+            // thing the tap does.
+            if history_now > history_before && self.tap_painted_a_stroke() {
+                if let Err(e) = self.inner.session.execute("edit.undo", serde_json::Value::Null) {
+                    log::warn!("undoing the tap's stroke: {e}");
+                }
+            }
+            // The shared runtime maps the finger count to the configured
+            // action (and ignores the gesture when stylus mode is off).
+            let ppp = ctx.pixels_per_point();
+            craftapps_shared::pen::on_gesture(
+                tap.fingers as i32,
+                tap.pos.x * ppp,
+                tap.pos.y * ppp,
+            );
+        }
+    }
+
+    /// Hand the stylus data of the motion events to the shared pen runtime:
+    /// the tool type (stylus / eraser end / palm) and the side button (the
+    /// S Pen's barrel button).
+    ///
+    /// The runtime keeps the pressed state and only acts on the transitions,
+    /// so the same state twice is harmless.
+    fn feed_stylus_state(&mut self) {
+        // Android tool types.
+        const TOOL_FINGER: i32 = 1;
+        const TOOL_MOUSE: i32 = 3;
+        // The stylus' side buttons.
+        const STYLUS_BUTTONS: u32 = (1 << 5) | (1 << 6);
+
+        // States arrive via the shared pen pump when it is running (it
+        // notes them for the diagnostics itself); otherwise drain the
+        // Android queue directly, as before.
+        let states = if craftapps_shared::pen::pen_pump_active() {
+            craftapps_shared::pen::take_queued_states()
+        } else {
+            let raw = android_activity::input::drain_stylus_states();
+            for state in &raw {
+                craftapps_shared::pen::note_queue_state(
+                    state.action,
+                    state.buttons,
+                    state.action_button as i32,
+                    state.tool_type,
+                );
+            }
+            raw
+        };
+        for state in states {
+            // A finger's touch is not the pen's business: it must not clear
+            // the pen's state (the pen may well still be down).
+            if (state.tool_type == TOOL_FINGER || state.tool_type == TOOL_MOUSE)
+                && state.buttons & STYLUS_BUTTONS == 0
+            {
+                continue;
+            }
+            // The pen runtime speaks the Java protocol: the Android action
+            // codes (0 down, 1 up, 2 move, 3 cancel) and the `BUTTON_*` bits.
+            craftapps_shared::pen::on_pen_event(
+                state.action,
+                state.tool_type,
+                state.buttons as i32,
+                state.action_button as i32,
+                state.x,
+                state.y,
+            );
+        }
+    }
+
+    /// Did the tap paint a stroke of its own? The history's last step names
+    /// the tool that made it.
+    fn tap_painted_a_stroke(&self) -> bool {
+        let Some(state) = self.inner.session.active() else { return false };
+        let Some(label) = state.history.undo_label() else { return false };
+        let label = label.to_ascii_lowercase();
+        label.contains("brush") || label.contains("pencil") || label.contains("eraser")
     }
 
     /// Shared [`craftapps_shared::pen`] actions → PhotoCraft tools. Runs after
@@ -247,6 +365,9 @@ impl AndroidShell {
 
 impl eframe::App for AndroidShell {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Modifiers and gestures first: the app must see the modifier state
+        // and a cleaned-up tap in the frame they happen.
+        self.process_input(ctx);
         self.inner.logic(ctx, frame);
     }
 

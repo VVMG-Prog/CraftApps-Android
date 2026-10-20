@@ -56,6 +56,7 @@ pub(crate) fn with_env<T>(f: impl FnOnce(&mut Env, &JObject) -> JniResult<T>) ->
 /// Install the bridge. Must run once, from `android_main`'s thread, which
 /// android-activity has already attached to the JVM and associated with
 /// `ndk-context`.
+#[cfg(target_os = "android")]
 pub fn init() -> Result<(), String> {
     let ctx = ndk_context::android_context();
     // SAFETY: android-activity guarantees `ndk-context` holds a valid JavaVM
@@ -75,6 +76,13 @@ pub fn init() -> Result<(), String> {
         .set((vm, activity))
         .map_err(|_| "JNI bridge initialised twice".to_string())?;
     Ok(())
+}
+
+/// The bridge is Android-only: the host build exists so the shared crate's
+/// pure logic (pen settings, gestures, modifiers) can be unit-tested.
+#[cfg(not(target_os = "android"))]
+pub fn init() -> Result<(), String> {
+    Err("the JNI bridge is Android-only".to_string())
 }
 
 pub(crate) fn jstring<'a>(env: &mut Env<'a>, s: &str) -> JniResult<JString<'a>> {

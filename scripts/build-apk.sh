@@ -45,6 +45,11 @@ mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android29-clang"
 export AR_aarch64_linux_android="$TOOLCHAIN/llvm-ar"
 
+# The stylus patch: android-activity vendored with the S Pen button / tool type
+# patch (see patches/android-activity-0.6.1-stylus.patch). The upstream
+# workspace points at the vendored copy through [patch.crates-io].
+"$MONOREPO/scripts/vendor-android-activity.sh"
+
 # --- version: single source of truth is VERSION_NAME in the Rust crate ---
 # Unified versioning: all apps share one version (e.g. 0.1.0).
 # versionCode = 100000 + major*10000 + minor*100 + patch  (0.1.0 -> 100100, monotonic).

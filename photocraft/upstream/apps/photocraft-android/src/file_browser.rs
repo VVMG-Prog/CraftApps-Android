@@ -30,6 +30,14 @@ struct Pending {
     reply: Option<FileDialogReply>,
 }
 
+/// A dialog handed over to the system picker: the browser closes and the reply
+/// waits for the picker's answer, which arrives through the file bridge.
+struct PendingPicker {
+    /// What the picker was asked for.
+    kind: craftapps_shared::picker_bridge::PickerKind,
+    reply: FileDialogReply,
+}
+
 struct Entry {
     name: String,
     is_dir: bool,
@@ -42,6 +50,8 @@ pub struct FileBrowser {
     /// Plain-fs fallback root when shared storage isn't granted.
     fallback_dir: Option<PathBuf>,
     pending: Option<Pending>,
+    /// The reply waiting for the system picker's answer.
+    picker: Option<PendingPicker>,
     /// Directory stack; empty = browser root.
     trail: Vec<Entry>,
     /// Selected ids for a multi-open.
@@ -60,6 +70,7 @@ impl FileBrowser {
             storage,
             fallback_dir,
             pending: None,
+            picker: None,
             trail: Vec::new(),
             selected: Vec::new(),
             highlighted: None,
@@ -83,6 +94,8 @@ impl FileBrowser {
         self.selected.clear();
         self.highlighted = None;
         self.error = None;
+        // A new dialog supersedes any reply still waiting for the picker.
+        self.picker = None;
         self.pending = Some(Pending { request, reply: Some(reply) });
     }
 
@@ -145,34 +158,20 @@ impl FileBrowser {
 
     /// Draw the pending dialog, if any. Called by the shell after the app frame.
     pub fn show(&mut self, ctx: &egui::Context) {
-        // Poll the file-based picker bridge for responses (no JNI).
-        // If a picker result arrived, deliver it to the pending request.
-        if self.pending.is_some() {
-            if let Some((id, paths, cancelled)) = craftapps_shared::picker_bridge::poll_response() {
-                let _ = id;
-                if !cancelled && !paths.is_empty() {
-                    // Deliver the picked paths as the answer
-                    if let Some(p) = self.pending.take() {
-                        if let Some(reply) = p.reply {
-                            let answer = FileDialogAnswer::Paths(paths);
-                            reply.send(Some(answer));
-                        }
-                    }
-                } else {
-                    // Cancelled: clear the pending request
-                    self.pending = None;
-                }
-                ctx.request_repaint();
-            }
-        }
+        // The system picker's answer, if it came. Polled every frame: the
+        // browser itself is closed while the picker is up, so the reply waits
+        // in `self.picker`, not in `self.pending`.
+        self.poll_picker(ctx);
 
         // Pull what the dialog needs out of the pending request first, so the
         // draw closure below only borrows `self` mutably.
-        let (is_save, filter, multiple) = match self.pending.as_ref() {
+        let (is_save, filter, multiple, is_folder) = match self.pending.as_ref() {
             Some(p) => match &p.request {
-                FileDialogRequest::Open { multiple, extensions, .. } => (false, extensions.clone(), *multiple),
-                FileDialogRequest::Save { .. } => (true, None, false),
-                FileDialogRequest::Folder { .. } => (false, None, false),
+                FileDialogRequest::Open { multiple, extensions, .. } => {
+                    (false, extensions.clone(), *multiple, false)
+                }
+                FileDialogRequest::Save { .. } => (true, None, false, false),
+                FileDialogRequest::Folder { .. } => (false, None, false, true),
             },
             None => return,
         };
@@ -287,7 +286,11 @@ impl FileBrowser {
                             }
                         }
                         if ui.button("Browse other locations…").clicked() {
-                            self.browse_elsewhere(multiple, filter.as_deref().unwrap_or(&[]));
+                            if is_folder {
+                                self.browse_for_folder();
+                            } else {
+                                self.browse_elsewhere(multiple, filter.as_deref().unwrap_or(&[]));
+                            }
                         }
                     });
                 }
@@ -335,78 +338,108 @@ impl FileBrowser {
         }
     }
 
-    /// "Browse other locations…": hand the reply to the SAF picker and close
-    /// the browser without answering; the SAF result answers it later.
+    /// "Browse other locations…": hand the reply to the system picker and close
+    /// the browser without answering; the picker's answer comes back through
+    /// the file bridge (see [`Self::poll_picker`]).
     fn browse_elsewhere(&mut self, multiple: bool, extensions: &[String]) {
         let mimes: Vec<String> =
             extensions.iter().filter_map(|e| saf::mime_for_extension(e)).map(str::to_string).collect();
         // The reply must cross into the shared SAF module's `DialogReply`
         // trait; adapt it here.
-        struct ReplyShim {
-            inner: Option<FileDialogReply>,
-            multiple: bool,
-        }
-        impl saf::DialogReply for ReplyShim {
-            fn send(self: Box<Self>, answer: Option<saf::DialogAnswer>) {
-                let Some(reply) = self.inner else { return };
-                let out = match answer {
-                    Some(saf::DialogAnswer::Paths(paths)) => Some(FileDialogAnswer::Paths(paths)),
-                    Some(saf::DialogAnswer::Contents(name, bytes)) => {
-                        if self.multiple {
-                            Some(FileDialogAnswer::ContentsMany(vec![(name, bytes)]))
-                        } else {
-                            Some(FileDialogAnswer::Contents(name, bytes))
-                        }
-                    }
-                    Some(saf::DialogAnswer::SaveTo(uri)) => Some(FileDialogAnswer::SaveTo(uri)),
-                    Some(saf::DialogAnswer::Folder(uri)) => Some(FileDialogAnswer::FolderTo(uri)),
-                    None => None,
-                };
-                reply.send(out);
-            }
-        }
         match saf::launch_open_document(multiple, &mimes) {
             Ok(()) => {
                 if let Some(reply) = self.take_reply() {
-                    let shim: Box<dyn saf::DialogReply> =
-                        Box::new(ReplyShim { inner: Some(reply), multiple });
-                    saf::set_pending_open(shim, multiple, self.storage.clone());
+                    self.picker = Some(PendingPicker {
+                        kind: craftapps_shared::picker_bridge::PickerKind::Open,
+                        reply,
+                    });
                 }
-                // `pending` is now empty: the window closes and SAF answers later.
+                // `pending` is now empty: the window closes and the picker
+                // answers later.
             }
             Err(e) => self.error = Some(e),
         }
     }
 
-    /// "Save elsewhere…": same handoff for `ACTION_CREATE_DOCUMENT`.
+    /// "Save elsewhere…": same handoff, for the system save picker.
     fn save_elsewhere(&mut self, name: &str) {
         let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
         let mime = saf::mime_for_extension(&ext).unwrap_or("application/octet-stream");
-        struct ReplyShim {
-            inner: Option<FileDialogReply>,
-        }
-        impl saf::DialogReply for ReplyShim {
-            fn send(self: Box<Self>, answer: Option<saf::DialogAnswer>) {
-                let Some(reply) = self.inner else { return };
-                let out = match answer {
-                    Some(saf::DialogAnswer::SaveTo(uri)) => Some(FileDialogAnswer::SaveTo(uri)),
-                    Some(saf::DialogAnswer::Paths(mut paths)) => {
-                        Some(FileDialogAnswer::SaveTo(paths.pop().unwrap_or_default()))
-                    }
-                    _ => None,
-                };
-                reply.send(out);
-            }
-        }
         match saf::launch_create_document(name, mime) {
             Ok(()) => {
                 if let Some(reply) = self.take_reply() {
-                    let shim: Box<dyn saf::DialogReply> = Box::new(ReplyShim { inner: Some(reply) });
-                    saf::set_pending_create(shim, name.to_string(), self.storage.clone());
+                    self.picker = Some(PendingPicker {
+                        kind: craftapps_shared::picker_bridge::PickerKind::Save,
+                        reply,
+                    });
                 }
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// A folder request goes to the system's tree picker; the answer is the
+    /// tree's URI, which also becomes the app's media location.
+    fn browse_for_folder(&mut self) {
+        match saf::launch_open_document_tree_bridge() {
+            Ok(()) => {
+                if let Some(reply) = self.take_reply() {
+                    self.picker = Some(PendingPicker {
+                        kind: craftapps_shared::picker_bridge::PickerKind::Folder,
+                        reply,
+                    });
+                }
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// The system picker's answer, delivered to the waiting dialog.
+    fn poll_picker(&mut self, ctx: &egui::Context) {
+        let Some(response) = craftapps_shared::picker_bridge::poll_response() else { return };
+        let Some(picker) = self.picker.take() else {
+            // An answer nobody waits for (the dialog was cancelled in between).
+            return;
+        };
+        if response.cancelled {
+            picker.reply.send(None);
+            ctx.request_repaint();
+            return;
+        }
+        let answer = match picker.kind {
+            craftapps_shared::picker_bridge::PickerKind::Open => {
+                if response.paths.is_empty() {
+                    None
+                } else {
+                    Some(FileDialogAnswer::Paths(response.paths))
+                }
+            }
+            craftapps_shared::picker_bridge::PickerKind::Save => {
+                // A document URI: the app writes through SAF, so the file lands
+                // where the user chose. The display name decides the format.
+                response.uri.map(|uri| {
+                    if let Some(name) = response.name.as_deref() {
+                        self.storage.record_uri_name(&uri, name);
+                    }
+                    FileDialogAnswer::SaveTo(uri)
+                })
+            }
+            craftapps_shared::picker_bridge::PickerKind::Folder => {
+                response.uri.and_then(|uri| {
+                    // Remember the tree as the app's media location, like the
+                    // SAF path did.
+                    match self.storage.set_sd_tree_uri(&uri) {
+                        Ok(()) => Some(FileDialogAnswer::FolderTo(uri)),
+                        Err(e) => {
+                            self.error = Some(e);
+                            None
+                        }
+                    }
+                })
+            }
+        };
+        picker.reply.send(answer);
+        ctx.request_repaint();
     }
 }
 

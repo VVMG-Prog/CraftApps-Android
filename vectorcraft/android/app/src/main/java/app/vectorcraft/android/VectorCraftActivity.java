@@ -1,319 +1,515 @@
 package app.vectorcraft.android;
 
 import android.app.NativeActivity;
+import android.content.ClipData;
 import android.content.Intent;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.OpenableColumns;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+
 /**
- * VectorCraft's activity: a {@link NativeActivity} subclass driven by the
- * Rust eframe shell.
+ * The app's activity: a {@link NativeActivity} subclass.
  *
- * <ul>
- *   <li>Bluetooth keyboard modifier tracking: winit's Android backend doesn't
- *       reliably report Ctrl/Shift/Alt meta state, so modifiers are tracked
- *       here and corrected KeyEvents are synthesized.</li>
- *   <li>Stylus side-channel: {@link #dispatchTouchEvent} still fires for
- *       NativeActivity subclasses. Pen-relevant state changes (tool type,
- *       barrel buttons) are forwarded to Rust via {@code nativeOnPenEvent};
- *       winit drops all of this, so without the hook the app can't tell a
- *       stylus from a finger. Throttled to state changes: a handful of JNI
- *       calls per stroke, not per motion event.</li>
- *   <li>SAF pickers: {@link #launchForResult} runs
- *       {@code startActivityForResult} on the UI thread (a call from the
- *       eframe render thread fails silently); results come back through
- *       {@code nativeOnActivityResult}.</li>
- * </ul>
+ * <p>Two jobs:
  *
- * The native library is loaded by the framework via the
- * {@code android.app.lib_name} meta-data, exactly as with a plain
- * NativeActivity.
+ * <ol>
+ *   <li><b>The file picker bridge.</b> The Storage Access Framework pickers
+ *       ({@code ACTION_OPEN_DOCUMENT}, {@code ACTION_CREATE_DOCUMENT}) can only
+ *       be launched from the UI thread, and the Rust side calls from the
+ *       eframe render thread, where a JNI call into the Activity fails
+ *       silently. So Rust writes a request file and this Activity polls for it
+ *       with a {@link Handler}, launches the picker itself and writes the
+ *       result back. See {@code shared/src/picker_bridge.rs}.
+ *   <li><b>The pen side-channel</b> (see below).
+ * </ol>
+ *
+ * <p><b>Input caveat (important).</b> {@code NativeActivity} calls
+ * {@code getWindow().takeInputQueue(this)} in {@code onCreate}, and AOSP
+ * documents that as "the window will no longer read and dispatch input events
+ * from the queue; it is your responsibility to do so". The native side (winit)
+ * owns the input queue, so the Java view hierarchy never sees a touch, key or
+ * generic-motion event: {@link #dispatchTouchEvent}, {@link #dispatchKeyEvent}
+ * and {@link #dispatchGenericMotionEvent} below are <i>not</i> called on this
+ * Activity. The multi-finger "stylus mode" gestures are therefore detected in
+ * Rust from egui's touch events (see {@code gestures.rs}); the pen side-channel
+ * is kept because it is the only path to the S Pen's barrel button if a
+ * Bluetooth S Pen ever reports one, but on a passive (non-Bluetooth) S Pen
+ * nothing ever arrives.
  */
 public class VectorCraftActivity extends NativeActivity {
-    // ---- Bluetooth keyboard modifier tracking ---------------------------------
-    /** Currently pressed modifier keys (bitmask: 1=Ctrl, 2=Shift, 4=Alt). */
-    private int modifierState = 0;
-
-    @Override
-    public boolean dispatchKeyEvent(KeyEvent event) {
-        int keyCode = event.getKeyCode();
-        int action = event.getAction();
-        boolean down = action == KeyEvent.ACTION_DOWN;
-
-        // Samsung S Pen button can arrive as KEYCODE_STYLUS_BUTTON_PRIMARY. Map it to
-        // the primary barrel button press/release in the pen side-channel.
-        if (keyCode == KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY) {
-            int motionAction =
-                    down ? MotionEvent.ACTION_BUTTON_PRESS : MotionEvent.ACTION_BUTTON_RELEASE;
-            nativeOnPenEvent(
-                    motionAction,
-                    MotionEvent.TOOL_TYPE_STYLUS,
-                    down ? MotionEvent.BUTTON_STYLUS_PRIMARY : 0,
-                    MotionEvent.BUTTON_STYLUS_PRIMARY);
-            return super.dispatchKeyEvent(event);
-        }
-
-        int mask = 0;
-        if (keyCode == KeyEvent.KEYCODE_CTRL_LEFT || keyCode == KeyEvent.KEYCODE_CTRL_RIGHT) {
-            mask = 1;
-        } else if (keyCode == KeyEvent.KEYCODE_SHIFT_LEFT || keyCode == KeyEvent.KEYCODE_SHIFT_RIGHT) {
-            mask = 2;
-        } else if (keyCode == KeyEvent.KEYCODE_ALT_LEFT || keyCode == KeyEvent.KEYCODE_ALT_RIGHT) {
-            mask = 4;
-        }
-
-        if (mask != 0) {
-            if (down) {
-                modifierState |= mask;
-            } else {
-                modifierState &= ~mask;
-            }
-            return super.dispatchKeyEvent(event);
-        } else {
-            int eventMeta = event.getMetaState();
-            int neededMeta = 0;
-            if ((modifierState & 1) != 0) neededMeta |= KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON;
-            if ((modifierState & 2) != 0) neededMeta |= KeyEvent.META_SHIFT_ON | KeyEvent.META_SHIFT_LEFT_ON;
-            if ((modifierState & 4) != 0) neededMeta |= KeyEvent.META_ALT_ON | KeyEvent.META_ALT_LEFT_ON;
-
-            if ((eventMeta & neededMeta) != neededMeta) {
-                KeyEvent corrected = new KeyEvent(
-                    event.getDownTime(),
-                    event.getEventTime(),
-                    action,
-                    keyCode,
-                    event.getRepeatCount(),
-                    eventMeta | neededMeta,
-                    event.getDeviceId(),
-                    event.getScanCode(),
-                    event.getFlags() | KeyEvent.FLAG_SOFT_KEYBOARD,
-                    event.getSource()
-                );
-                return super.dispatchKeyEvent(corrected);
-            }
-            return super.dispatchKeyEvent(event);
-        }
+    /** Starts a picker for result. May be called from any thread. */
+    public static void launchForResult(android.app.Activity activity, Intent intent, int requestCode) {
+        activity.runOnUiThread(() -> activity.startActivityForResult(intent, requestCode));
     }
 
-    // ---- Stylus side-channel ---------------------------------------------------
-    /** Last tool type / button state forwarded to Rust (throttle state changes). */
+    // ---- Pen side-channel -------------------------------------------------
+    // winit's Android backend turns every pointer into a generic Touch and
+    // drops the tool type (stylus/finger/eraser/palm) and the barrel-button
+    // state. The Java side-channel would report those, but on a NativeActivity
+    // the input queue belongs to the native side, so these hooks do not run
+    // (see the class comment). Kept for the day the app stops being a
+    // NativeActivity: the protocol is documented in
+    // craftapps-shared/src/pen.rs.
 
     // TOOL_TYPE_PALM was added in API 35; we compile against 34, so define it locally.
     private static final int TOOL_TYPE_PALM = 5;
 
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
-        // Handle Samsung S Pen button proprietary actions
-        int rawAction = event.getActionMasked();
-        if (isSPenButtonAction(rawAction)) {
-            // Synthesize button press: map to standard action with button state
-            int mappedAction = mapSPenButtonAction(rawAction);
-            int buttons = event.getButtonState() | MotionEvent.BUTTON_STYLUS_PRIMARY;
-            // DEBUG: show toast so user can see if Java receives the event
-            android.widget.Toast.makeText(this, "S Pen button: " + rawAction, android.widget.Toast.LENGTH_SHORT).show();
-            nativeOnPenEvent(mappedAction, event.getToolType(0), buttons,
-                MotionEvent.BUTTON_STYLUS_PRIMARY, event.getX(), event.getY());
-            // Also let it through as a normal touch event
-        }
         int action = event.getActionMasked();
         int tool = event.getToolType(event.getActionIndex());
         int buttons = event.getButtonState();
-        // Forward stylus/eraser/palm state changes only; fingers need no tracking.
-        // Also catch button press/release actions which can arrive here.
-        boolean penRelevant = tool == MotionEvent.TOOL_TYPE_STYLUS
-                || tool == MotionEvent.TOOL_TYPE_ERASER
-                || tool == TOOL_TYPE_PALM
-                || tool == MotionEvent.TOOL_TYPE_MOUSE
-                || (buttons & (MotionEvent.BUTTON_STYLUS_PRIMARY
-                        | MotionEvent.BUTTON_STYLUS_SECONDARY)) != 0
-                || action == MotionEvent.ACTION_BUTTON_PRESS
-                || action == MotionEvent.ACTION_BUTTON_RELEASE;
-        if (penRelevant && (tool != lastPenTool || buttons != lastPenButtons)) {
-            lastPenTool = tool;
-            lastPenButtons = buttons;
-            nativeOnPenEvent(
-                    action,
-                    tool,
-                    buttons,
-                    event.getActionButton());
-        } else if (!penRelevant) {
-            lastPenTool = -1;
-            lastPenButtons = -1;
+        boolean penRelevant =
+                tool == MotionEvent.TOOL_TYPE_STYLUS
+                        || tool == MotionEvent.TOOL_TYPE_ERASER
+                        || tool == TOOL_TYPE_PALM
+                        || (buttons
+                                        & (MotionEvent.BUTTON_STYLUS_PRIMARY
+                                                | MotionEvent.BUTTON_STYLUS_SECONDARY))
+                                != 0
+                        || action == MotionEvent.ACTION_BUTTON_PRESS
+                        || action == MotionEvent.ACTION_BUTTON_RELEASE;
+        if (penRelevant) {
+            nativeOnPenEvent(action, tool, buttons, event.getActionButton(), event.getX(), event.getY());
         }
         return super.dispatchTouchEvent(event);
     }
 
     private native void nativeOnPenEvent(int action, int toolType, int buttonState, int actionButton, float x, float y);
 
-    // ---- Stylus button via generic motion / key events ---------------------------
-    // Samsung S Pen button presses don't always come through dispatchTouchEvent.
-    // Some devices deliver them as generic motion events (SOURCE_STYLUS) or as
-    // KEYCODE_STYLUS_BUTTON_PRIMARY key events. Handle both so the button is reliable.
+    // ---- Stylus button via generic motion / key events --------------------
+    // Some devices deliver the S Pen's barrel button as a generic motion event
+    // (SOURCE_STYLUS) or as KEYCODE_STYLUS_BUTTON_PRIMARY.
 
     @Override
     public boolean dispatchGenericMotionEvent(MotionEvent event) {
         int source = event.getSource();
-        // Stylus button events via generic motion (e.g. hover button press).
         if ((source & android.view.InputDevice.SOURCE_STYLUS) != 0) {
             int action = event.getActionMasked();
             int tool = event.getToolType(event.getActionIndex());
             int buttons = event.getButtonState();
             if (action == MotionEvent.ACTION_BUTTON_PRESS
                     || action == MotionEvent.ACTION_BUTTON_RELEASE
-                    || (buttons & (MotionEvent.BUTTON_STYLUS_PRIMARY
-                            | MotionEvent.BUTTON_STYLUS_SECONDARY)) != 0) {
-                // Forward as-is; Rust handles ACTION_BUTTON_PRESS/RELEASE and held-state.
-                // Don't consume; let the framework also process it.
+                    || (buttons
+                                    & (MotionEvent.BUTTON_STYLUS_PRIMARY
+                                            | MotionEvent.BUTTON_STYLUS_SECONDARY))
+                            != 0) {
                 nativeOnPenEvent(action, tool, buttons, event.getActionButton(), event.getX(), event.getY());
             }
         }
         return super.dispatchGenericMotionEvent(event);
     }
 
-    // ---- SAF pickers ------------------------------------------------------------
-    /**
-     * Starts an activity for result. Must run on the UI thread: Rust calls
-     * this from the eframe render thread, where startActivityForResult fails
-     * silently.
-     */
-    public static void launchForResult(android.app.Activity activity, Intent intent, int requestCode) {
-        activity.runOnUiThread(() -> activity.startActivityForResult(intent, requestCode));
+    // ---- Bluetooth keyboard modifiers ------------------------------------
+    // winit's Android backend never sends `ModifiersChanged`, so egui's
+    // modifier state is always empty. The Rust shell tracks Ctrl/Shift/Alt from
+    // the key events themselves; this hook is only a fallback for a future
+    // non-NativeActivity shell.
+
+    private int modifierState = 0;
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
+        if (keyCode == KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY) {
+            int action =
+                    down ? MotionEvent.ACTION_BUTTON_PRESS : MotionEvent.ACTION_BUTTON_RELEASE;
+            nativeOnPenEvent(
+                    action,
+                    MotionEvent.TOOL_TYPE_STYLUS,
+                    down ? MotionEvent.BUTTON_STYLUS_PRIMARY : 0,
+                    MotionEvent.BUTTON_STYLUS_PRIMARY,
+                    0, 0);
+            return super.dispatchKeyEvent(event);
+        }
+        int bit = 0;
+        if (keyCode == KeyEvent.KEYCODE_CTRL_LEFT || keyCode == KeyEvent.KEYCODE_CTRL_RIGHT) {
+            bit = 1;
+        } else if (keyCode == KeyEvent.KEYCODE_SHIFT_LEFT || keyCode == KeyEvent.KEYCODE_SHIFT_RIGHT) {
+            bit = 2;
+        } else if (keyCode == KeyEvent.KEYCODE_ALT_LEFT || keyCode == KeyEvent.KEYCODE_ALT_RIGHT) {
+            bit = 4;
+        }
+        if (bit != 0) {
+            if (down) {
+                modifierState |= bit;
+            } else {
+                modifierState &= ~bit;
+            }
+            nativeOnModifierState(modifierState);
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    private native void nativeOnModifierState(int modifiers);
+
+    // ---- File picker bridge ----------------------------------------------
+    // Rust writes <bridge>/request.json, this Activity polls for it, launches
+    // the system picker and writes <bridge>/response.json.
+
+    private static final int REQ_BRIDGE_OPEN = 1001;
+    private static final int REQ_BRIDGE_SAVE = 1002;
+    private static final int REQ_BRIDGE_FOLDER = 1003;
+    private static final long POLL_MS = 400;
+
+    private final Handler pickerHandler = new Handler(Looper.getMainLooper());
+    private boolean pickerBridgeStarted = false;
+    /** The request the open picker answers (-1 = none). */
+    private long bridgeRequestId = -1;
+    /** "open" or "save". */
+    private String bridgeRequestKind = "";
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        // NativeActivity.onCreate loads the native library and takes over the
+        // window's surface and input queue; the bridge starts after it.
+        super.onCreate(savedInstanceState);
+        applyImmersiveFullscreen();
+        startPickerBridge();
+    }
+
+
+    /** Force true fullscreen: hide the status bar and the system navigation
+     *  bar / tablet taskbar ("dock") so they never overlay the app. Sticky
+     *  immersive: a swipe from a screen edge reveals the bars briefly. */
+    private void applyImmersiveFullscreen() {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                getWindow().setDecorFitsSystemWindows(false);
+                android.view.WindowInsetsController c = getWindow().getInsetsController();
+                if (c != null) {
+                    c.hide(android.view.WindowInsets.Type.systemBars());
+                    c.setSystemBarsBehavior(
+                        android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                }
+            } else {
+                getWindow().getDecorView().setSystemUiVisibility(
+                    android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | android.view.View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | android.view.View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+            }
+        } catch (Exception ignored) {
+            // Fullscreen is cosmetic; never let it break start-up.
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            // The system restores the bars on focus changes (dialogs, the
+            // picker returning); re-apply so the app stays fullscreen.
+            applyImmersiveFullscreen();
+        }
+    }
+
+    private void startPickerBridge() {
+        if (pickerBridgeStarted) {
+            return;
+        }
+        pickerBridgeStarted = true;
+        // A request left over from a previous run would open the system picker
+        // at start-up; drop it.
+        try {
+            File stale = new File(bridgeDir(), "request.json");
+            if (stale.isFile()) {
+                stale.delete();
+            }
+        } catch (Exception ignored) {
+            // Not fatal: the poll below reports the problem.
+        }
+        pickerHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    checkPickerRequest();
+                } catch (Throwable ignored) {
+                    // Keep polling: a half-written request file is not fatal.
+                }
+                pickerHandler.postDelayed(this, POLL_MS);
+            }
+        }, POLL_MS);
+    }
+
+    /** Where the bridge files live: the app's own external files dir. */
+    private File bridgeDir() {
+        File base = getExternalFilesDir(null);
+        if (base == null) {
+            base = getFilesDir();
+        }
+        return new File(base, ".picker");
+    }
+
+    private void checkPickerRequest() {
+        try {
+            File req = new File(bridgeDir(), "request.json");
+            if (!req.isFile()) {
+                return;
+            }
+            String text = new String(java.nio.file.Files.readAllBytes(req.toPath()));
+            if (!req.delete()) {
+                // Another poll already took it.
+                return;
+            }
+            org.json.JSONObject r = new org.json.JSONObject(text);
+            long id = r.optLong("id", -1);
+            String kind = r.optString("kind", "open");
+            boolean multiple = r.optBoolean("multiple", false);
+            String name = r.optString("name", "");
+            org.json.JSONArray mimes = r.optJSONArray("mimes");
+
+            Intent intent;
+            int code;
+            if ("save".equals(kind)) {
+                intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                        .addCategory(Intent.CATEGORY_OPENABLE)
+                        .putExtra(Intent.EXTRA_TITLE, name.isEmpty() ? "file" : name);
+                intent.setType(mimeForName(name));
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                code = REQ_BRIDGE_SAVE;
+            } else if ("folder".equals(kind)) {
+                intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                code = REQ_BRIDGE_FOLDER;
+            } else {
+                intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                        .addCategory(Intent.CATEGORY_OPENABLE)
+                        .setType("*/*");
+                if (mimes != null && mimes.length() > 0) {
+                    String[] types = new String[mimes.length()];
+                    for (int i = 0; i < mimes.length(); i++) {
+                        types[i] = mimes.optString(i, "*/*");
+                    }
+                    intent.putExtra(Intent.EXTRA_MIME_TYPES, types);
+                }
+                if (multiple) {
+                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                }
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                code = REQ_BRIDGE_OPEN;
+            }
+            // Only now is the request ours: a result arriving before this
+            // would be misattributed.
+            bridgeRequestId = id;
+            bridgeRequestKind = kind;
+            try {
+                startActivityForResult(intent, code);
+            } catch (Exception e) {
+                bridgeRequestId = -1;
+                bridgeRequestKind = "";
+                writePickerResponse(id, null, null, true, null);
+            }
+        } catch (Exception e) {
+            // A malformed or half-written request: ignore it and keep polling.
+        }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQ_BRIDGE_OPEN || requestCode == REQ_BRIDGE_SAVE) {
-            handleBridgeResult(requestCode, resultCode, data);
+        if (requestCode == REQ_BRIDGE_OPEN
+                || requestCode == REQ_BRIDGE_SAVE
+                || requestCode == REQ_BRIDGE_FOLDER) {
+            handleBridgeResult(resultCode, data);
             return;
         }
         nativeOnActivityResult(requestCode, resultCode, data);
     }
 
-    private void handleBridgeResult(int requestCode, int resultCode, Intent data) {
+    private void handleBridgeResult(int resultCode, Intent data) {
         long id = bridgeRequestId;
+        String kind = bridgeRequestKind;
         bridgeRequestId = -1;
-        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
-            writePickerResponse(id, new String[0], true);
+        bridgeRequestKind = "";
+        if (id < 0) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null) {
+            writePickerResponse(id, null, null, true, null);
             return;
         }
         try {
-            android.net.Uri uri = data.getData();
-            // Copy to a temp file Rust can read
-            java.io.File inbox = new java.io.File("/sdcard/CraftApps/.picker/inbox/" + id);
-            inbox.mkdirs();
-            String name = "picked";
-            try (android.database.Cursor cur = getContentResolver().query(uri, null, null, null, null)) {
-                if (cur != null && cur.moveToFirst()) {
-                    int idx = cur.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
-                    if (idx >= 0) name = cur.getString(idx);
+            if ("save".equals(kind)) {
+                // A save: hand back the document URI so the app writes through
+                // SAF (the file lands where the user chose).
+                Uri uri = data.getData();
+                if (uri == null) {
+                    writePickerResponse(id, null, null, true, null);
+                    return;
                 }
-            } catch (Exception e) { /* use default */ }
-            java.io.File out = new java.io.File(inbox, name);
-            try (java.io.InputStream in = getContentResolver().openInputStream(uri);
-                 java.io.OutputStream outStream = new java.io.FileOutputStream(out)) {
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = in.read(buf)) > 0) outStream.write(buf, 0, n);
-            }
-            writePickerResponse(id, new String[]{out.getAbsolutePath()}, false);
-        } catch (Exception e) {
-            writePickerResponse(id, new String[0], true);
-        }
-    }
-
-    private native void nativeOnActivityResult(int requestCode, int resultCode, Intent data);
-
-    // ---- File picker bridge (polls for Rust requests) --------------------
-    private android.os.Handler pickerHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-    private boolean pickerBridgeStarted = false;
-    private static final int REQ_BRIDGE_OPEN = 1001;
-    private static final int REQ_BRIDGE_SAVE = 1002;
-    private long bridgeRequestId = -1;
-
-    private void startPickerBridge() {
-        pickerHandler.postDelayed(new Runnable() {
-            @Override public void run() {
-                checkPickerRequest();
-                pickerHandler.postDelayed(this, 500);
-            }
-        }, 500);
-    }
-
-    private void checkPickerRequest() {
-        try {
-            java.io.File req = new java.io.File("/sdcard/CraftApps/.picker/request.json");
-            if (!req.isFile()) return;
-            String text = new String(java.nio.file.Files.readAllBytes(req.toPath()));
-            req.delete();
-            org.json.JSONObject r = new org.json.JSONObject(text);
-            long id = r.getLong("id");
-            String kind = r.getString("kind");
-            bridgeRequestId = id;
-            Intent intent;
-            int code;
-            if ("open".equals(kind)) {
-                intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                code = REQ_BRIDGE_OPEN;
+                takePersistableWrite(uri);
+                writePickerResponse(id, null, uri.toString(), false, displayName(uri));
+            } else if ("folder".equals(kind)) {
+                // A folder: hand back the tree URI.
+                Uri uri = data.getData();
+                if (uri == null) {
+                    writePickerResponse(id, null, null, true, null);
+                    return;
+                }
+                takePersistableWrite(uri);
+                writePickerResponse(id, null, uri.toString(), false, displayName(uri));
             } else {
-                intent = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
-                    .setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE, r.optString("name", "file"));
-                code = REQ_BRIDGE_SAVE;
-            }
-            try {
-                startActivityForResult(intent, code);
-            } catch (Exception e) {
-                writePickerResponse(id, new String[0], true);
-                bridgeRequestId = -1;
+                // An open: copy the picked files into the app's own storage so
+                // the app can read them as ordinary files.
+                ArrayList<Uri> uris = new ArrayList<>();
+                ClipData clip = data.getClipData();
+                if (clip != null) {
+                    for (int i = 0; i < clip.getItemCount(); i++) {
+                        Uri u = clip.getItemAt(i).getUri();
+                        if (u != null) {
+                            uris.add(u);
+                        }
+                    }
+                } else if (data.getData() != null) {
+                    uris.add(data.getData());
+                }
+                if (uris.isEmpty()) {
+                    writePickerResponse(id, null, null, true, null);
+                    return;
+                }
+                String[] paths = new String[uris.size()];
+                for (int i = 0; i < uris.size(); i++) {
+                    paths[i] = copyIntoInbox(id, i, uris.get(i));
+                }
+                writePickerResponse(id, paths, null, false, null);
             }
         } catch (Exception e) {
-            // No request or parse error; keep polling
+            writePickerResponse(id, null, null, true, null);
         }
     }
 
-    private void writePickerResponse(long id, String[] paths, boolean cancelled) {
+    /** Keep read/write access to a document across restarts when the provider allows it. */
+    private void takePersistableWrite(Uri uri) {
+        try {
+            getContentResolver().takePersistableUriPermission(uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        } catch (Exception ignored) {
+            // The grant lasts for this session anyway.
+        }
+    }
+
+    /** Copy a picked document into <bridge>/inbox/<id>/ and return its path. */
+    private String copyIntoInbox(long id, int index, Uri uri) throws Exception {
+        File inbox = new File(bridgeDir(), "inbox/" + id);
+        inbox.mkdirs();
+        String name = displayName(uri);
+        if (name == null || name.trim().isEmpty()) {
+            name = "picked-" + index;
+        }
+        name = name.replace('/', '_').replace('\\', '_');
+        File out = new File(inbox, index + "-" + name);
+        try (InputStream in = getContentResolver().openInputStream(uri);
+             OutputStream os = new FileOutputStream(out)) {
+            if (in == null) {
+                throw new IllegalStateException("couldn't open " + name);
+            }
+            byte[] buf = new byte[16384];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                os.write(buf, 0, n);
+            }
+        }
+        return out.getAbsolutePath();
+    }
+
+    /** The document's display name, or its last path segment. */
+    private String displayName(Uri uri) {
+        try (Cursor cur = getContentResolver().query(uri, null, null, null, null)) {
+            if (cur != null && cur.moveToFirst()) {
+                int idx = cur.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) {
+                    String n = cur.getString(idx);
+                    if (n != null && !n.trim().isEmpty()) {
+                        return n;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Fall through to the path segment.
+        }
+        return uri.getLastPathSegment();
+    }
+
+    private void writePickerResponse(long id, String[] paths, String uri, boolean cancelled, String name) {
         try {
             org.json.JSONObject resp = new org.json.JSONObject();
             resp.put("id", id);
             resp.put("cancelled", cancelled);
-            org.json.JSONArray arr = new org.json.JSONArray();
-            for (String p : paths) arr.put(p);
-            resp.put("paths", arr);
-            java.io.File dir = new java.io.File("/sdcard/CraftApps/.picker");
+            if (paths != null) {
+                org.json.JSONArray arr = new org.json.JSONArray();
+                for (String p : paths) {
+                    arr.put(p);
+                }
+                resp.put("paths", arr);
+            }
+            if (uri != null) {
+                resp.put("uri", uri);
+            }
+            if (name != null) {
+                resp.put("name", name);
+            }
+            File dir = bridgeDir();
             dir.mkdirs();
-            java.io.File tmp = new java.io.File(dir, "response.json.tmp");
+            File tmp = new File(dir, "response.json.tmp");
             java.nio.file.Files.write(tmp.toPath(), resp.toString().getBytes());
-            tmp.renameTo(new java.io.File(dir, "response.json"));
-        } catch (Exception e) { /* ignore */ }
-    }
-
-
-    // Samsung S Pen button proprietary action codes.
-    // When the S Pen button is held, Samsung uses these instead of the standard
-    // ACTION_DOWN/MOVE/UP. Without handling them, the button press is invisible.
-    private static final int ACTION_DOWN_WITH_1ST_BUTTON = 211;
-    private static final int ACTION_MOVE_WITH_1ST_BUTTON = 213;
-    private static final int ACTION_UP_WITH_1ST_BUTTON = 212;
-    private static final int ACTION_CANCEL_WITH_1ST_BUTTON = 214;
-
-    /** Returns true if this is a Samsung S Pen button action. */
-    private static boolean isSPenButtonAction(int action) {
-        return action == ACTION_DOWN_WITH_1ST_BUTTON
-            || action == ACTION_MOVE_WITH_1ST_BUTTON
-            || action == ACTION_UP_WITH_1ST_BUTTON
-            || action == ACTION_CANCEL_WITH_1ST_BUTTON;
-    }
-
-    /** Maps Samsung button actions to standard actions + button state. */
-    private static int mapSPenButtonAction(int action) {
-        switch (action) {
-            case ACTION_DOWN_WITH_1ST_BUTTON: return MotionEvent.ACTION_DOWN;
-            case ACTION_MOVE_WITH_1ST_BUTTON: return MotionEvent.ACTION_MOVE;
-            case ACTION_UP_WITH_1ST_BUTTON: return MotionEvent.ACTION_UP;
-            case ACTION_CANCEL_WITH_1ST_BUTTON: return MotionEvent.ACTION_CANCEL;
-            default: return action;
+            tmp.renameTo(new File(dir, "response.json"));
+        } catch (Exception ignored) {
+            // The Rust side will time the request out; nothing else to do.
         }
     }
 
+    /** The MIME type for a file name (the save picker's type). */
+    private static String mimeForName(String name) {
+        String lower = name == null ? "" : name.toLowerCase();
+        if (lower.endsWith(".psd") || lower.endsWith(".psb")) {
+            return "image/vnd.adobe.photoshop";
+        }
+        if (lower.endsWith(".png")) {
+            return "image/png";
+        }
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+            return "image/jpeg";
+        }
+        if (lower.endsWith(".webp")) {
+            return "image/webp";
+        }
+        if (lower.endsWith(".gif")) {
+            return "image/gif";
+        }
+        if (lower.endsWith(".bmp")) {
+            return "image/bmp";
+        }
+        if (lower.endsWith(".tif") || lower.endsWith(".tiff")) {
+            return "image/tiff";
+        }
+        if (lower.endsWith(".svg")) {
+            return "image/svg+xml";
+        }
+        if (lower.endsWith(".pdf")) {
+            return "application/pdf";
+        }
+        return "application/octet-stream";
+    }
+
+    private native void nativeOnActivityResult(int requestCode, int resultCode, Intent data);
 }

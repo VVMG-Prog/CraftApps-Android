@@ -38,7 +38,7 @@ use crate::shell::{AndroidShell, StorageGate};
 
 /// Port version, shown in the UI and used by the updater. `build-apk.sh`
 /// derives the Gradle `versionCode` from it.
-pub const VERSION_NAME: &str = "0.3.9";
+pub const VERSION_NAME: &str = "0.4.5";
 
 /// Per-app glue for the shared GPU cascade: attach the wgpu render state to
 /// the app for GPU canvas compositing, or record the CPU fallback.
@@ -130,6 +130,10 @@ fn run(app: AndroidApp) -> Result<(), String> {
     // Rust thread) exists, so no other thread can read the environment
     // concurrently. (Edition 2024 made `set_var` unsafe for data races.)
     unsafe { std::env::set_var("PHOTOCRAFT_CONFIG_DIR", &config) };
+    // The file picker bridge lives in the app's own external files dir: always
+    // writable, and no "All files access" permission needed. The Java side
+    // reads the same path (`getExternalFilesDir(null)/.picker`).
+    unsafe { std::env::set_var("CRAFTAPPS_BRIDGE_DIR", files_dir.join(".picker")) };
 
     let gallery: GalleryFlag = Arc::new(Mutex::new(None));
     // The in-app browser is rooted at the shared media location when granted,

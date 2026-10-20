@@ -135,7 +135,17 @@ impl ViewOptions {
         self.extras && flag
     }
     pub fn hides_chrome(&self) -> bool {
-        self.screen_mode == "fullScreen"
+        // ANDROID-PORT: the menu bar is the only way to the Android menu
+        // entries (Edit ▸ Stylus Settings…, Help ▸ Check for Updates) and the
+        // options bar carries the tool options, so the chrome stays visible.
+        #[cfg(target_os = "android")]
+        {
+            false
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            self.screen_mode == "fullScreen"
+        }
     }
     pub fn hides_tabs(&self) -> bool {
         self.screen_mode != "standard"

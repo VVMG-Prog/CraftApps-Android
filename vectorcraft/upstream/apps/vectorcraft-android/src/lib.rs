@@ -25,7 +25,7 @@ use vectorcraft_ui_egui::VectorcraftApp;
 
 /// Port version, shown in the UI. `build-apk.sh` derives the Gradle
 /// `versionCode` from it (`0.1.0` → 100100).
-pub const VERSION_NAME: &str = "0.1.0";
+pub const VERSION_NAME: &str = "0.2.1";
 
 const APP_NAME: &str = "VectorCraft";
 
@@ -80,6 +80,17 @@ fn run(app: AndroidApp) -> Result<(), String> {
         .unwrap_or_else(|| cache_dir.clone());
     let pen_settings = pen::PenSettings::load(&settings_dir);
     pen::sync_settings(&pen_settings);
+
+    // The file picker bridge lives in the app's own external files dir: always
+    // writable, and no "All files access" permission needed. The Java side
+    // reads the same path (`getExternalFilesDir(null)/.picker`).
+    let bridge_base = app.external_data_path().unwrap_or_else(|| cache_dir.clone());
+    let bridge_dir = bridge_base.join(".picker");
+    let _ = std::fs::create_dir_all(&bridge_dir);
+    // SAFETY: `android_main` runs before the eframe UI thread (or any other
+    // Rust thread) exists, so no other thread can read the environment
+    // concurrently. (Edition 2024 made `set_var` unsafe for data races.)
+    unsafe { std::env::set_var("CRAFTAPPS_BRIDGE_DIR", &bridge_dir) };
 
     // Shared GPU cascade (Vulkan → GLES → CPU).
     let gpu_plan = gpu::plan(
@@ -137,6 +148,6 @@ pub unsafe extern "system" fn Java_app_vectorcraft_android_VectorCraftActivity_n
     x: jni::sys::jfloat,
     y: jni::sys::jfloat,
 ) {
-    // handle_pen_event catches unwinds itself; plain integers cross the ABI.
-    pen::handle_pen_event(action, tool, buttons, action_button);
+    // handle_pen_event catches unwinds itself; plain integers/floats cross the ABI.
+    pen::handle_pen_event(action, tool, buttons, action_button, x, y);
 }
