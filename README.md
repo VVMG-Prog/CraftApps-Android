@@ -1,22 +1,74 @@
-# CraftApps-Android
+# CraftApps for Android
 
-Unofficial Android ports of the CraftApps design suite, tailored for digital artists.
+Unofficial Android ports of the Craft suite by the ArtCraft team
+([storytold](https://github.com/storytold)), rebuilt for tablets with
+full S Pen support. Each app is a separate APK sharing one codebase of
+Android plumbing: a file-based SAF picker bridge, a shared pen runtime,
+a GPU cascade, and shared suite storage under `/sdcard/CraftApps/`.
 
 ## Apps
-- **PhotoCraft** (0.10.0) - Raster image editor
-- **VectorCraft** (0.13.1) - Vector graphics editor
-- **LightCraft** (0.9.1) - Photo lighting editor
-- **DesignCraft** (0.9.0) - Layout/design tool
-- **PdfCraft** (0.9.0) - PDF viewer/editor
 
-## Android Features
-- Stylus/pen support with pressure
-- Hardware acceleration (Vulkan → GLES → CPU)
-- Storage Access Framework for file browsing
-- Shared `/sdcard/CraftApps/` storage
+| App | Version | What it is |
+|---|---|---|
+| **PhotoCraft** | 0.4.5 | Raster image editor (Photoshop-style) |
+| **VectorCraft** | 0.2.1 | Vector graphics editor |
+| **LightCraft** | 0.9.4 | Photo library & lighting editor |
+| **DesignCraft** | 0.9.2 | Layout / design tool |
+| **PdfCraft** | 0.2.1 | PDF viewer & editor |
+| **FilmCraft** | 0.1.1 | Video editor |
+| **EffectCraft** | 0.1.0 | Effects / compositing |
+| **SoundCraft** | 0.1.0 | Audio workstation (DAW) |
+
+APKs are attached to the [latest release](../../releases/latest).
+Install over the top to update — package names and signing keys are
+stable across builds.
+
+## Android features
+
+- **S Pen support** — pressure, eraser end, palm rejection, and the
+  barrel button, *including while hovering* (the button press wakes
+  the app via a pen input pump, so remapped actions fire immediately).
+  Buttons and gestures are remappable in Stylus Settings.
+- **File open/save/folders** through the Android system picker
+  (Storage Access Framework) via a file-based bridge — the same
+  method in every app. Opened files are copied to an in-app inbox;
+  saves write where you picked.
+- **Hardware acceleration** — Vulkan → GLES → CPU cascade.
+- **Immersive fullscreen** — the system dock/bars stay out of the way.
+- **Shared storage** — `/sdcard/CraftApps/Media/` for work,
+  `/sdcard/CraftApps/Settings/<App>/` for settings. Apps ask for
+  All-files access on first run; libraries and folders are used as
+  real filesystem paths.
+
+## Known issues (October 2026 builds)
+
+- **DesignCraft**: saving can crash the app — under investigation.
+  Open files first, save early.
+- **EffectCraft**: cold start shows a black screen for a few seconds
+  before the UI appears; it works normally after that.
+- **SoundCraft**: microphone recording goes through AAudio; report
+  back if your device delivers no audio.
 
 ## Building
-See `scripts/build-apk.sh` for per-app builds.
 
-## Note
-FilmCraft (video editor) is excluded until file handling is properly solved.
+Builds run on a machine with the Rust toolchain, Android SDK + NDK 27
+and JDK 17:
+
+```
+./scripts/build-apk.sh <app>   # photocraft, vectorcraft, lightcraft,
+                               # designcraft, pdfcraft, filmcraft,
+                               # effectcraft, soundcraft
+```
+
+The script vendors and patches `android-activity` (stylus support),
+builds the app's Rust crate for `aarch64-linux-android`, page-aligns
+the native libraries, and signs with the suite keystore (not in this
+repo — see `AGENTS.md` / `PATCHES.md` for the port's patch notes).
+
+## Credits & licence
+
+Unofficial Android port — based on PhotoCraft, VectorCraft,
+LightCraft, DesignCraft, PdfCraft, FilmCraft, EffectCraft and
+SoundCraft by the ArtCraft team. Upstream sources live under each
+app's `upstream/` directory with their own licences
+(Apache-2.0 / MIT). The Android port code is original work.
