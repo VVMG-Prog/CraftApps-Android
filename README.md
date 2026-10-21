@@ -8,7 +8,7 @@ a GPU cascade, and shared suite storage under `/sdcard/CraftApps/`.
 
 ## Apps
 
-| App | Version | What it is |
+| App | Port version | What it is |
 |---|---|---|
 | **PhotoCraft** | 0.4.5 | Raster image editor (Photoshop-style) |
 | **VectorCraft** | 0.2.1 | Vector graphics editor |
@@ -18,6 +18,16 @@ a GPU cascade, and shared suite storage under `/sdcard/CraftApps/`.
 | **FilmCraft** | 0.1.1 | Video editor |
 | **EffectCraft** | 0.1.0 | Effects / compositing |
 | **SoundCraft** | 0.1.0 | Audio workstation (DAW) |
+
+## Versioning
+
+Two version lines, kept separate:
+
+- **`v<x>`** — the official app version from the upstream source
+  (the ArtCraft team's own releases).
+- **`P<x>`** — this Android port's version. Suite releases are
+  tagged `P<version>` (current: **P0.1.0**); each app also carries
+  its own port version (above), which is what its APK reports.
 
 APKs are attached to the [latest release](../../releases/latest).
 Install over the top to update — package names and signing keys are
